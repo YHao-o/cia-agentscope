@@ -40,7 +40,19 @@ _MOCK_USERS = {
         "permissions": {
             "agent_whitelist": [
                 {"id": "123", "name": "制度问答", "show": 1},
-                {"id": "999", "name": "生成PPT智能体", "show": 0},
+                {
+                    "id": "999",
+                    "name": "生成PPT智能体",
+                    "show": 0,
+                    # mcpClientConfig 示例（联调时替换为真实 MCP 服务地址）
+                    "mcpClientConfig": {
+                        "code": "ppt_mcp",
+                        "transport_type": "streamable_http",
+                        "transport_url": "http://localhost:8000/mcp",
+                        "query_params": {"demo": "1"},
+                        "authorization": "Bearer demo-token",
+                    },
+                },
             ],
             "skill_blacklist": [
                 {"id": "456", "name": "博查搜索", "code": "bocha_search"},
@@ -60,7 +72,19 @@ _MOCK_USERS = {
         "permissions": {
             "agent_whitelist": [
                 {"id": "123", "name": "制度问答", "show": "1"},
-                {"id": "999", "name": "生成PPT智能体", "show": 0},
+                {
+                    "id": "999",
+                    "name": "生成PPT智能体",
+                    "show": 0,
+                    # mcpClientConfig 示例（联调时替换为真实 MCP 服务地址）
+                    "mcpClientConfig": {
+                        "code": "ppt_mcp",
+                        "transport_type": "streamable_http",
+                        "transport_url": "http://localhost:8000/mcp",
+                        "query_params": {"demo": "1"},
+                        "authorization": "Bearer demo-token",
+                    },
+                },
             ],
             "skill_blacklist": [],
         },

@@ -7,7 +7,9 @@
 """
 import logging
 import os
+import re
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlencode, urlsplit
 
 import yaml
 from agentscope.agent import Agent, ContextConfig, ReActConfig
@@ -71,16 +73,93 @@ class AgentRegistry:
     def get_definition(self, agent_id: str) -> Optional[AgentDefinition]:
         return self._defs.get(agent_id)
 
+    def _build_mcp_clients(self, definition: AgentDefinition) -> list:
+        """根据智能体定义中的 mcp_client_config 构建 stateless HTTP MCP 客户端。
+
+        配置来自登录时 mng 下发的 agent_access 项 mcpClientConfig
+        （经 merge_external_into_memory 附加、Redis 缓存透传）。
+        字段缺失/构建失败时记日志返回空列表，不影响该智能体其他工具；
+        MCP 服务不可达由 Toolkit 在列举工具时自动跳过，不影响对话。
+
+        Returns:
+            [MCPClient, ...]，最多一个（每个白名单项至多一个 mcpClientConfig）
+        """
+        cfg = getattr(definition, "mcp_client_config", None)
+        if not isinstance(cfg, dict) or not cfg:
+            return []
+
+        transport_url = str(cfg.get("transport_url") or "")
+        if not transport_url:
+            logger.warning(
+                f"[AgentRegistry] agent={definition.id} "
+                f"mcpClientConfig 缺 transport_url，跳过 MCP 注册"
+            )
+            return []
+
+        # query_params：dict 用 urlencode 拼接；str 视为已编码的查询串
+        query_params = cfg.get("query_params")
+        if isinstance(query_params, dict) and query_params:
+            sep = "&" if "?" in transport_url else "?"
+            transport_url = f"{transport_url}{sep}{urlencode(query_params)}"
+        elif isinstance(query_params, str) and query_params.strip():
+            sep = "&" if "?" in transport_url else "?"
+            transport_url = f"{transport_url}{sep}{query_params.lstrip('?')}"
+
+        # transport_type 仅用于校验告警：AgentScope 按 URL path 自动判定
+        # SSE（/sse、/messages/ 结尾）与 Streamable HTTP，不改造 URL
+        transport_type = str(cfg.get("transport_type") or "").lower()
+        if transport_type == "sse":
+            path = urlsplit(transport_url).path
+            if not (path.endswith("/sse") or path.endswith("/messages/")):
+                logger.warning(
+                    f"[AgentRegistry] agent={definition.id} transport_type=sse "
+                    f"但 URL 不符合 SSE 路径模式，按 URL 自动判定: {transport_url}"
+                )
+
+        # authorization 为完整 Authorization 请求头值，原样使用
+        headers = {}
+        authorization = cfg.get("authorization")
+        if authorization:
+            headers["Authorization"] = authorization
+
+        # MCPClient name 须匹配 ^[a-zA-Z0-9_-]+$（组合工具名 mcp__{name}__tool）
+        name = re.sub(
+            r"[^a-zA-Z0-9_-]", "_", str(cfg.get("code") or definition.id)
+        ) or "mcp_server"
+
+        try:
+            from agentscope.mcp import MCPClient, HttpMCPConfig
+
+            return [
+                MCPClient(
+                    name=name,
+                    # stateless：无需 connect/close 生命周期，不可达自动跳过
+                    is_stateful=False,
+                    mcp_config=HttpMCPConfig(
+                        url=transport_url,
+                        headers=headers or None,
+                    ),
+                )
+            ]
+        except Exception:
+            logger.exception(
+                f"[AgentRegistry] agent={definition.id} MCP 客户端构建失败，跳过"
+            )
+            return []
+
     def _build_toolkit_for(self, definition: AgentDefinition) -> Toolkit:
         """根据智能体绑定的 skill 列表，筛选工具子集组装 Toolkit。
 
         有效绑定技能 = agent 自身绑定技能 ∪ 请求级附加技能（extra_skill_names）。
         无任何绑定技能时返回空 Toolkit，即纯对话无工具。
         """
+        # MCP 客户端（agent_access 项 mcpClientConfig → stateless HTTP MCP）
+        mcps = self._build_mcp_clients(definition)
+
         # 有效绑定技能 = agent 自身绑定 ∪ 请求级附加技能
         bound_skill_names = set(definition.skills) | self._extra_skill_names
         if not bound_skill_names:
-            return Toolkit(tools=[], skills_or_loaders=[])
+            return Toolkit(tools=[], skills_or_loaders=[], mcps=mcps)
 
         # 从 skill 元信息中筛选出绑定的 skill loader
         bound_loaders = []
@@ -101,7 +180,9 @@ class AgentRegistry:
                 f"[AgentRegistry] 技能未在 workspace 装载，已跳过: {sorted(missing)}"
             )
 
-        return Toolkit(tools=self._all_tools, skills_or_loaders=bound_loaders)
+        return Toolkit(
+            tools=self._all_tools, skills_or_loaders=bound_loaders, mcps=mcps
+        )
 
     def get_toolkit(self, agent_id: str) -> Optional[Toolkit]:
         """获取智能体的 Toolkit（带缓存）。"""
