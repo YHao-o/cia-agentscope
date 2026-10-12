@@ -30,6 +30,7 @@ _MINERU_EXTENSIONS = {
 }
 
 _MINERU_POLL_INTERVAL = 2  # 秒
+_MINERU_POLL_MAX_RETRIES = 2  # 单次结果查询断连后最多重试两次，不重新提交任务
 
 # 统一超时/失败文案（诚实入库，问答时注入给 agent）
 _MINERU_TIMEOUT_MSG = "解析超时，MinerU服务暂时无法解析该文件"
@@ -97,9 +98,24 @@ async def parse_document_with_mineru(content: bytes, filename: str) -> str:
         elapsed = 0
         async with httpx.AsyncClient(timeout=30.0) as client:
             while elapsed < UPLOAD_PARSE_TIMEOUT:
-                r = await client.get(
-                    f"{base}/tasks/{task_id}/result", headers=headers
-                )
+                for attempt in range(_MINERU_POLL_MAX_RETRIES + 1):
+                    try:
+                        r = await client.get(
+                            f"{base}/tasks/{task_id}/result", headers=headers
+                        )
+                        break
+                    except httpx.RemoteProtocolError:
+                        if attempt >= _MINERU_POLL_MAX_RETRIES:
+                            raise
+                        logger.warning(
+                            "[upload-parse] MinerU 查询结果连接中断，重试原任务 "
+                            "task_id=%s retry=%s/%s",
+                            task_id, attempt + 1, _MINERU_POLL_MAX_RETRIES,
+                        )
+                        await asyncio.sleep(_MINERU_POLL_INTERVAL)
+                        elapsed += _MINERU_POLL_INTERVAL
+                        if elapsed >= UPLOAD_PARSE_TIMEOUT:
+                            return _MINERU_TIMEOUT_MSG
                 if r.status_code != 200:
                     return f"解析失败，MinerU服务暂时无法解析该文件（HTTP {r.status_code}）"
                 data = r.json()
