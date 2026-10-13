@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "cia-agentscope.fullname" . }}
+  labels:
+    {{- include "cia-agentscope.labels" . | nindent 4 }}
+data:
+  MYSQL_HOST: {{ .Values.externalMysql.host | quote }}
+  MYSQL_PORT: {{ .Values.externalMysql.port | quote }}
+  MYSQL_USER: {{ .Values.externalMysql.user | quote }}
+  MYSQL_DATABASE: {{ .Values.externalMysql.database | quote }}
+  REDIS_URL: {{ .Values.externalRedis.url | quote }}
+  REDIS_SESSION_TTL: {{ .Values.externalRedis.sessionTtl | quote }}
+  SESSION_FILES_PERSIST_DIR: {{ .Values.storage.mountPath | quote }}
+  OPENSANDBOX_DOMAIN: {{ .Values.opensandbox.domain | quote }}
+  OPENSANDBOX_PROTOCOL: {{ .Values.opensandbox.protocol | quote }}
+  OPENSANDBOX_USE_SERVER_PROXY: {{ .Values.opensandbox.useServerProxy | quote }}
+  OPENSANDBOX_IMAGE: {{ .Values.opensandbox.image | quote }}
+  OPENSANDBOX_RESOURCE_CPU: {{ .Values.opensandbox.resourceCpu | quote }}
+  OPENSANDBOX_RESOURCE_MEMORY: {{ .Values.opensandbox.resourceMemory | quote }}
+  WORKSPACE_TTL: {{ .Values.opensandbox.workspaceTtl | quote }}
+  OPENSANDBOX_POOL_SIZE: {{ .Values.opensandbox.poolSize | quote }}
+  OPENSANDBOX_POOL_REFILL: {{ .Values.opensandbox.poolRefill | quote }}
+  LOG_LEVEL: {{ .Values.logging.level | quote }}
+  LOG_DIR: {{ .Values.logging.dir | quote }}
