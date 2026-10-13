@@ -16,8 +16,9 @@ logger = logging.getLogger(__name__)
 _MNG_INTENTS_PATH = "/api/intents"
 
 # AUTH_MOCK=true 时的内置外部意图（结构与 mng /api/intents 返回一致），
-# 用于本地无 mng 服务时联调：agent id=999 与 user_dao._MOCK_USERS 白名单的
-# "生成PPT智能体"项（含 mcpClientConfig 示例）匹配，可验证 MCP 配置全链路。
+# 用于本地无 mng 服务时联调：agent id=999/1000 与 user_dao._MOCK_USERS 白名单的
+# "生成PPT智能体"/"联网搜索智能体"项（均含 mcpClientConfig）匹配，
+# 可验证 MCP 配置全链路（1000 为百度千帆 AI Search 真实 MCP 服务）。
 _MOCK_EXTERNAL_INTENTS = [
     {
         "id": 9001,
@@ -30,6 +31,20 @@ _MOCK_EXTERNAL_INTENTS = [
             "name": "生成PPT智能体",
             "code": "agent_ppt",
             "system_prompt": "你是PPT生成智能体，负责根据用户需求生成PPT。",
+        },
+        "skills": [],
+    },
+    {
+        "id": 9002,
+        "name": "联网搜索",
+        "intentCode": "web_search",
+        "status": 1,
+        "definition": "搜索实时信息，并使用大模型进行总结回复",
+        "agent": {
+            "id": "1000",
+            "name": "联网搜索智能体",
+            "code": "agent_search",
+            "system_prompt": "你是联网搜索智能体，负责搜索实时信息并总结回复。",
         },
         "skills": [],
     },
