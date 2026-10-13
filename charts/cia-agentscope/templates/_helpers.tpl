@@ -57,4 +57,3 @@ app.kubernetes.io/instance: {{ .Release.Name }}
 {{- required "existingSecret.name is required when secret.create=false" .Values.existingSecret.name }}
 {{- end }}
 {{- end }}
-
