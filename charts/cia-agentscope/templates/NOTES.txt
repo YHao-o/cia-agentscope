@@ -1,0 +1,13 @@
+1. Inspect the application Service:
+   kubectl get service {{ include "cia-agentscope.fullname" . }} -n {{ .Release.Namespace }}
+
+2. Wait for the application rollout:
+   kubectl rollout status deployment/{{ include "cia-agentscope.fullname" . }} -n {{ .Release.Namespace }} --timeout=10m
+
+3. Forward the ClusterIP Service and check application health:
+   kubectl port-forward service/{{ include "cia-agentscope.fullname" . }} -n {{ .Release.Namespace }} 7010:{{ .Values.service.port }}
+   curl http://127.0.0.1:7010/health
+
+OpenSandbox is not installed by this Chart. Functions that require a sandbox
+remain unavailable until OpenSandbox is deployed separately and its connection
+settings are updated with helm upgrade.

@@ -164,7 +164,7 @@
         "periodSeconds": { "type": "integer", "minimum": 1 },
         "timeoutSeconds": { "type": "integer", "minimum": 1 },
         "failureThreshold": { "type": "integer", "minimum": 1 },
-        "successThreshold": { "type": "integer", "minimum": 1 }
+        "successThreshold": { "type": "integer", "minimum": 1, "maximum": 1 }
       }
     }
   },
