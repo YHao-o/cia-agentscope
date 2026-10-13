@@ -59,6 +59,8 @@ UPLOAD_ALLOWED_MEDIA_TYPES = [
     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",  # xlsx
     "application/vnd.ms-powerpoint",  # ppt
     "application/vnd.openxmlformats-officedocument.presentationml.presentation",  # pptx
+    "application/wps-office.xlsx",
+    "application/wps-office.docx",
     # 音频（上传时调用音频转写模型解析）
     "audio/mpeg",  # mp3
     "audio/mp4",  # m4a

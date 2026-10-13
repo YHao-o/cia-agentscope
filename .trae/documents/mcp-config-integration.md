@@ -1,4 +1,9 @@
-# 方案：agent_access 元素携带 mcpClientConfig → 为对应用户配置 MCP 工具
+# 开发总结：agent_access 元素携带 mcpClientConfig → 为对应用户配置 MCP 工具
+
+> 状态：已实施并通过 E2E 验证（含真实 MCP 服务调用）。
+> 分支 `feat/mcp-client-config`，主提交 `00008e4`（6 文件 +375/-8）；
+> 另有少量后续追加未提交（见第六节）。
+> 评审入口：第三、四节为设计细节，第六节为实施后追加项，第七节为验证证据，第八节为评审关注点。
 
 ## 一、背景与目标
 
@@ -196,3 +201,91 @@ cleaned = {k: v for k, v in item.items() if k not in ("show", "mcpClientConfig")
 3. **会话验证（MCP 不可达降级）**：`POST /chat`（`agent_id="agent_ppt"`，或直接提问命中该意图）→ 日志出现 `Skipping MCP 'ppt_mcp' ...`（占位 URL 连不上），对话正常返回 —— 证明降级路径 OK
 4. **会话验证（真实 MCP）**：本地起一个 MCP 服务（如 `mcp-server-time` 的 HTTP 版或任意 streamable_http 服务），替换 mock `transport_url` → 重新登录 → chat → 事件流中模型可调用 `mcp__ppt_mcp__*` 工具并返回结果
 5. **回归**：`search_enabled=false`、无 MCP 的普通用户路径（zhangsan 原有权限）行为不变
+
+## 六、实施后追加项（未提交，随下次 commit 一并评审）
+
+### 1. 联网搜索智能体 mock（百度千帆 AI Search，真实 MCP 服务）
+
+为验证真实 MCP 调用链路，在 mock 数据中新增第二个带 MCP 的智能体：
+
+- `app/dao/user_dao.py`：admin/zhangsan 白名单新增 id=1000"联网搜索智能体"，
+  `mcpClientConfig` 指向千帆 AI Search（`https://qianfan.baidubce.com/v2/ai_search/mcp`，
+  Bearer key 为真实联调凭证，**评审时注意：key 已硬编码进源码，若仓库公开需改走 .env**）
+- `app/services/mng_service.py`：`_MOCK_EXTERNAL_INTENTS` 新增 `web_search` 意图（agent id=1000，无绑定 skill），与白名单匹配
+
+注意点：该智能体**只挂 MCP 不挂 skill**，验证了"纯 MCP 智能体"路径——
+`_build_toolkit_for` 的无技能 early-return 分支 `Toolkit(tools=[], skills_or_loaders=[], mcps=mcps)` 首次被真实流量覆盖。
+
+### 2. `config/model_config.yml`：default 模型补 `context_size: 32768`
+
+**问题**：default 模型缺 `context_size` 字段，AgentScope 误用 `max_tokens: 4096` 当上下文窗口
+→ 压缩阈值 2867 过小 → MCP 工具描述（较长）+ 系统 prompt 合计 ~5300 token 反复触发压缩，
+曾出现一次 400 Bad Request（上下文超模上限被 API 拒绝）。
+
+**修复**：显式声明 `context_size: 32768`（与 `max_tokens` 分离，前者是窗口、后者是单次生成上限）。
+属于 MCP 功能引出的必要配置修复，与本功能一起评审。
+
+（同文件其余大量改动为用户手工调整的其他配置，不在本次评审范围。）
+
+## 七、验证记录（实测证据）
+
+### 单元验证（临时脚本，跑完即删）
+
+`merge_external_into_memory(mock 意图 + admin 权限)` 输出：
+
+```
+白名单 ids: ['123', '999', '1000']
+外部意图: [('generate_ppt', '999'), ('web_search', '1000')]
+agent: 999 生成PPT智能体 | mcp: ppt_mcp http://localhost:8000/mcp
+agent: 1000 联网搜索智能体 | mcp: aisearch_mcp https://qianfan.baidubce.com/v2/ai_search/mcp
+```
+
+Toolkit 构造验证：`ppt_mcp` 组合出 `Toolkit(tools=[], skills_or_loaders=[], mcps=[MCPClient])`，
+name/URL/headers 均正确（query_params `{"demo":"1"}` 正确拼接为 `?demo=1`）。
+
+### E2E 验证（真实 MCP，实测日志）
+
+用户提问"apec期间福田哪些地方放假"，链路实录：
+
+```
+QueryRewriter 改写 → 意图识别命中 web_search → 路由联网搜索智能体
+[ mcp.client.streamable_http ] Negotiated protocol version: 2025-06-18   ← MCP 握手成功
+模型调用 mcp__aisearch_mcp__chatCompletions 完成搜索并总结回答
+```
+
+后续"周日天气怎么样"实测：模型经 ReAct 循环调用 `mcp__aisearch_mcp__chatCompletions` 三次
+（无城市信息时模型自主选择"全国概况→主要城市→补充城市"递进搜索），证明工具调用与结果消费完全正常。
+
+### 降级验证
+
+占位 URL（ppt_mcp → localhost:8000）场景：Toolkit `list_tools` 失败自动跳过
+（日志 `Skipping MCP 'ppt_mcp' ...`），对话正常进行，无崩溃。
+
+### 可观测性
+
+Langfuse：MCP 工具调用以 `tool-mcp__{name}__{tool}` 子 observation 记录（复用现有
+ToolCallStart/ToolResultEnd 埋点，error 计入 toolFailures）。MCP 不可达时仅应用日志有
+Skipping warning，Langfuse 无痕迹（模型未发起调用），属预期。
+
+## 八、评审关注点清单
+
+| # | 关注点 | 位置 | 预期结论 |
+|---|---|---|---|
+| 1 | **凭证安全**：authorization 是否可能下发前端或写入日志 | auth.py `_normalize_agent_access`；registry.py `_build_mcp_clients` | 前端响应已剥离；日志只记 URL 不记 headers |
+| 2 | **硬编码 API key**（千帆联调凭证进源码） | user_dao.py id=1000 mock | 需确认仓库可见性；公开仓库须改 .env |
+| 3 | stateless 选择是否正确（连接泄漏风险） | registry.py `is_stateful=False` | 正确：Toolkit 无 close 钩子，stateful 必泄漏 |
+| 4 | 失败安全：MCP 不可达是否拖垮对话 | Toolkit `_get_available_tools`（框架层） | 自动跳过 + warning，已实测 |
+| 5 | pydantic 静默丢键风险 | base.py `mcp_client_config` 字段 | 已显式声明，merge→定义透传闭环 |
+| 6 | name 清洗边界（code 含中文/特殊字符） | registry.py `re.sub(r"[^a-zA-Z0-9_-]", "_", ...)` | 兜底 definition.id，再兜底 "mcp_server" |
+| 7 | query_params 兼容性（dict/str 双格式） | registry.py | dict→urlencode；str→原样拼接；null→跳过 |
+| 8 | 生效时机：权限变更需重新登录 | Redis `user_config:{uid}` TTL 7 天 | 设计如此，注意运营口径 |
+| 9 | 只影响外部智能体（基础 agent 不挂 MCP） | merge 白名单匹配逻辑 | 白名单 id 与基础 agent id 无交集，无回归 |
+| 10 | `agent_access` vs `agent_whitelist` 字段名 | mng_service.py 全部读 `agent_whitelist` | 需与 mng 侧确认真实字段名一致，否则白名单恒空 |
+
+## 九、遗留事项
+
+1. 千帆 API key 迁移到 .env（视仓库可见性决定优先级）
+2. mng 真实联调：确认真实返回字段名为 `agent_whitelist`（关注点 #10）
+3. 搜索智能体 system_prompt 较简（实测出现一轮 3 次搜索；可加"缺关键信息优先追问/限搜索次数"约束）
+4. 意图描述命中率：`web_search` definition 较窄，"查一下…"类表述可能落到 general_chat（可扩 definition）
+5. models/auth.py L47 `agent_access: List[str]` 标注过时（实际为对象数组），未在本次范围
