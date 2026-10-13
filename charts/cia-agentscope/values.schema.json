@@ -1,0 +1,203 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "required": [
+    "replicaCount",
+    "image",
+    "containerPort",
+    "service",
+    "storage",
+    "externalMysql",
+    "externalRedis",
+    "existingSecret",
+    "secret"
+  ],
+  "properties": {
+    "replicaCount": { "type": "integer", "minimum": 1 },
+    "image": {
+      "type": "object",
+      "required": ["repository", "tag", "pullPolicy"],
+      "properties": {
+        "repository": { "type": "string", "minLength": 1 },
+        "tag": { "type": "string" },
+        "pullPolicy": { "type": "string", "enum": ["Always", "IfNotPresent", "Never"] }
+      }
+    },
+    "imagePullSecrets": { "type": "array", "items": { "type": "object" } },
+    "nameOverride": { "type": "string" },
+    "fullnameOverride": { "type": "string" },
+    "containerPort": { "type": "integer", "minimum": 1, "maximum": 65535 },
+    "serviceAccount": {
+      "type": "object",
+      "required": ["create", "automount", "annotations", "name"],
+      "properties": {
+        "create": { "type": "boolean" },
+        "automount": { "type": "boolean" },
+        "annotations": { "type": "object" },
+        "name": { "type": "string" }
+      }
+    },
+    "podAnnotations": { "type": "object" },
+    "podLabels": { "type": "object" },
+    "podSecurityContext": { "type": "object" },
+    "securityContext": { "type": "object" },
+    "service": {
+      "type": "object",
+      "required": ["type", "port", "annotations"],
+      "properties": {
+        "type": { "type": "string", "enum": ["ClusterIP"] },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "annotations": { "type": "object" }
+      }
+    },
+    "deploymentStrategy": { "type": "object" },
+    "terminationGracePeriodSeconds": { "type": "integer", "minimum": 1 },
+    "probes": {
+      "type": "object",
+      "required": ["startup", "readiness", "liveness"],
+      "properties": {
+        "startup": { "$ref": "#/definitions/probe" },
+        "readiness": { "$ref": "#/definitions/probe" },
+        "liveness": { "$ref": "#/definitions/probe" }
+      }
+    },
+    "storage": {
+      "type": "object",
+      "required": ["type", "hostPath", "mountPath", "existingClaim"],
+      "properties": {
+        "type": { "type": "string", "enum": ["hostPath", "existingClaim"] },
+        "hostPath": { "type": "string" },
+        "mountPath": { "type": "string", "minLength": 1 },
+        "existingClaim": { "type": "string" }
+      }
+    },
+    "externalMysql": {
+      "type": "object",
+      "required": ["host", "port", "user", "database"],
+      "properties": {
+        "host": { "type": "string", "minLength": 1 },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "user": { "type": "string", "minLength": 1 },
+        "database": { "type": "string", "minLength": 1 }
+      }
+    },
+    "externalRedis": {
+      "type": "object",
+      "required": ["url", "sessionTtl"],
+      "properties": {
+        "url": { "type": "string", "minLength": 1 },
+        "sessionTtl": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "opensandbox": {
+      "type": "object",
+      "required": ["domain", "protocol", "useServerProxy", "image", "resourceCpu", "resourceMemory", "workspaceTtl", "poolSize", "poolRefill"],
+      "properties": {
+        "domain": { "type": "string", "minLength": 1 },
+        "protocol": { "type": "string", "enum": ["http", "https"] },
+        "useServerProxy": { "type": "boolean" },
+        "image": { "type": "string", "minLength": 1 },
+        "resourceCpu": { "type": "string", "minLength": 1 },
+        "resourceMemory": { "type": "string", "minLength": 1 },
+        "workspaceTtl": { "type": "number", "exclusiveMinimum": 0 },
+        "poolSize": { "type": "integer", "minimum": 0 },
+        "poolRefill": { "type": "boolean" }
+      }
+    },
+    "logging": {
+      "type": "object",
+      "required": ["level", "dir"],
+      "properties": {
+        "level": { "type": "string", "minLength": 1 },
+        "dir": { "type": "string", "minLength": 1 }
+      }
+    },
+    "existingSecret": {
+      "type": "object",
+      "required": ["name", "keys"],
+      "properties": {
+        "name": { "type": "string" },
+        "keys": {
+          "type": "object",
+          "required": ["mysqlPassword", "jwtSecret", "configEncryptionKey", "opensandboxApiKey"],
+          "properties": {
+            "mysqlPassword": { "type": "string", "minLength": 1 },
+            "jwtSecret": { "type": "string", "minLength": 1 },
+            "configEncryptionKey": { "type": "string", "minLength": 1 },
+            "opensandboxApiKey": { "type": "string", "minLength": 1 }
+          }
+        }
+      }
+    },
+    "secret": {
+      "type": "object",
+      "required": ["create", "stringData"],
+      "properties": {
+        "create": { "type": "boolean" },
+        "stringData": {
+          "type": "object",
+          "properties": {
+            "MYSQL_PASSWORD": { "type": "string" },
+            "JWT_SECRET": { "type": "string" },
+            "CONFIG_ENCRYPTION_KEY": { "type": "string" },
+            "OPENSANDBOX_API_KEY": { "type": "string" }
+          }
+        }
+      }
+    },
+    "resources": { "type": "object" },
+    "nodeSelector": { "type": "object" },
+    "tolerations": { "type": "array" },
+    "affinity": { "type": "object" },
+    "extraEnv": { "type": "array", "items": { "type": "object" } },
+    "extraEnvFrom": { "type": "array", "items": { "type": "object" } },
+    "extraVolumes": { "type": "array", "items": { "type": "object" } },
+    "extraVolumeMounts": { "type": "array", "items": { "type": "object" } }
+  },
+  "definitions": {
+    "probe": {
+      "type": "object",
+      "required": ["enabled", "initialDelaySeconds", "periodSeconds", "timeoutSeconds", "failureThreshold", "successThreshold"],
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "initialDelaySeconds": { "type": "integer", "minimum": 0 },
+        "periodSeconds": { "type": "integer", "minimum": 1 },
+        "timeoutSeconds": { "type": "integer", "minimum": 1 },
+        "failureThreshold": { "type": "integer", "minimum": 1 },
+        "successThreshold": { "type": "integer", "minimum": 1 }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "storage": { "properties": { "type": { "const": "hostPath" } } } } },
+      "then": { "properties": { "storage": { "properties": { "hostPath": { "minLength": 1 } } } } }
+    },
+    {
+      "if": { "properties": { "storage": { "properties": { "type": { "const": "existingClaim" } } } } },
+      "then": { "properties": { "storage": { "properties": { "existingClaim": { "minLength": 1 } } } } }
+    },
+    {
+      "if": { "properties": { "secret": { "properties": { "create": { "const": false } } } } },
+      "then": { "properties": { "existingSecret": { "properties": { "name": { "minLength": 1 } } } } }
+    },
+    {
+      "if": { "properties": { "secret": { "properties": { "create": { "const": true } } } } },
+      "then": {
+        "properties": {
+          "secret": {
+            "properties": {
+              "stringData": {
+                "required": ["MYSQL_PASSWORD", "JWT_SECRET"],
+                "properties": {
+                  "MYSQL_PASSWORD": { "minLength": 1 },
+                  "JWT_SECRET": { "minLength": 1 }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

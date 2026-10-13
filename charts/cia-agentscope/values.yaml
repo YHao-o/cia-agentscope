@@ -1,0 +1,125 @@
+replicaCount: 1
+
+image:
+  repository: registry.ccdc.cn:5000/cia-agentscope
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+containerPort: 7010
+
+serviceAccount:
+  create: true
+  automount: false
+  annotations: {}
+  name: ""
+
+podAnnotations: {}
+podLabels: {}
+podSecurityContext: {}
+
+# The current Dockerfile runs as root. Do not enable runAsNonRoot until the
+# image declares a fixed non-root UID/GID and the SFS permissions are verified.
+securityContext:
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+  readOnlyRootFilesystem: false
+
+service:
+  type: ClusterIP
+  port: 7010
+  annotations: {}
+
+deploymentStrategy:
+  type: RollingUpdate
+  rollingUpdate:
+    maxSurge: 1
+    maxUnavailable: 0
+
+terminationGracePeriodSeconds: 60
+
+probes:
+  startup:
+    enabled: true
+    initialDelaySeconds: 0
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 30
+    successThreshold: 1
+  readiness:
+    enabled: true
+    initialDelaySeconds: 0
+    periodSeconds: 10
+    timeoutSeconds: 3
+    failureThreshold: 3
+    successThreshold: 1
+  liveness:
+    enabled: true
+    initialDelaySeconds: 0
+    periodSeconds: 20
+    timeoutSeconds: 3
+    failureThreshold: 3
+    successThreshold: 1
+
+storage:
+  type: hostPath
+  hostPath: /app/dify/sfs
+  mountPath: /data/session-files
+  existingClaim: ""
+
+externalMysql:
+  host: ""
+  port: 3306
+  user: ""
+  database: agentscope
+
+externalRedis:
+  url: ""
+  sessionTtl: 86400
+
+opensandbox:
+  domain: localhost:9080
+  protocol: http
+  useServerProxy: true
+  image: registry.ccdc.cn:5000/python:3.13-slim
+  resourceCpu: 100m
+  resourceMemory: 128Mi
+  workspaceTtl: 3600
+  poolSize: 0
+  poolRefill: true
+
+logging:
+  level: INFO
+  dir: /app/logs
+
+existingSecret:
+  name: ""
+  keys:
+    mysqlPassword: MYSQL_PASSWORD
+    jwtSecret: JWT_SECRET
+    configEncryptionKey: CONFIG_ENCRYPTION_KEY
+    opensandboxApiKey: OPENSANDBOX_API_KEY
+
+# Development-only convenience. Production should keep create=false and use
+# existingSecret.name. Do not commit real credentials here.
+secret:
+  create: false
+  stringData:
+    MYSQL_PASSWORD: ""
+    JWT_SECRET: ""
+    CONFIG_ENCRYPTION_KEY: ""
+    OPENSANDBOX_API_KEY: ""
+
+resources: {}
+nodeSelector: {}
+tolerations: []
+affinity: {}
+extraEnv: []
+extraEnvFrom: []
+extraVolumes: []
+extraVolumeMounts: []

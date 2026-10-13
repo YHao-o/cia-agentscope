@@ -1,0 +1,11 @@
+.DS_Store
+.git/
+.gitignore
+.idea/
+.vscode/
+*.swp
+*.tmp
+*.tgz
+__pycache__/
+.pytest_cache/
+tests/

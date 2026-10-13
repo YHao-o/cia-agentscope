@@ -1,0 +1,51 @@
+replicaCount: 1
+
+image:
+  repository: registry.ccdc.cn:5000/cia-agentscope
+  tag: "20261013-1" # Replace with the immutable tag pushed to the internal registry.
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: [] # Example: [{ name: registry-credentials }]
+
+service:
+  type: ClusterIP
+  port: 7010
+
+storage:
+  type: hostPath
+  hostPath: /app/dify/sfs
+  mountPath: /data/session-files
+  existingClaim: ""
+
+externalMysql:
+  host: mysql.database.svc.cluster.local
+  port: 3306
+  user: agentscope
+  database: agentscope
+
+externalRedis:
+  url: redis://redis.cache.svc.cluster.local:6379/0
+  sessionTtl: 86400
+
+existingSecret:
+  name: cia-agentscope-secrets
+
+secret:
+  create: false
+
+opensandbox:
+  domain: localhost:9080
+  poolSize: 0
+
+resources:
+  requests:
+    cpu: 500m
+    memory: 1Gi
+  limits:
+    cpu: "2"
+    memory: 4Gi
+
+# If only some nodes have passed the SFS preflight check, label those nodes and
+# enable a selector here. The user has confirmed that all current nodes mount
+# the same SFS path, so the example leaves scheduling unrestricted.
+nodeSelector: {}
