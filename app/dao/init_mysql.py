@@ -1,4 +1,4 @@
-"""MySQL 建表初始化。"""
+﻿"""MySQL 建表初始化。"""
 import logging
 
 import aiomysql
@@ -46,6 +46,7 @@ CREATE TABLE IF NOT EXISTS messages (
     message_pair_id VARCHAR(64) NULL DEFAULT NULL,
     citations       JSON NULL,
     bocha_sum       JSON NULL,
+    content_parts   JSON NULL,
     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
@@ -164,21 +165,23 @@ CREATE INDEX idx_gaps_question_hash ON knowledge_gaps(question_hash);
 CREATE INDEX idx_gaps_status ON knowledge_gaps(status);
 
 -- 兼容已存在表：追加 agent_ids 列（MySQL 8 支持 IF NOT EXISTS）
-ALTER TABLE sessions ADD COLUMN IF NOT EXISTS (agent_ids JSON NULL DEFAULT NULL);
-ALTER TABLE messages ADD COLUMN IF NOT EXISTS (agent_ids JSON NULL DEFAULT NULL);
-ALTER TABLE messages ADD COLUMN IF NOT EXISTS (user_id VARCHAR(64) NOT NULL DEFAULT '');
-ALTER TABLE messages ADD COLUMN IF NOT EXISTS (success TINYINT(1) NOT NULL DEFAULT 1);
-ALTER TABLE messages ADD COLUMN IF NOT EXISTS (tokens INT NOT NULL DEFAULT 0);
-ALTER TABLE upload_files ADD COLUMN IF NOT EXISTS (user_id VARCHAR(64) NOT NULL DEFAULT '');
-ALTER TABLE upload_files ADD COLUMN IF NOT EXISTS (file_size BIGINT NOT NULL DEFAULT 0);
-ALTER TABLE messages ADD COLUMN IF NOT EXISTS (message_pair_id VARCHAR(64) NULL DEFAULT NULL);
-ALTER TABLE messages ADD COLUMN IF NOT EXISTS (citations JSON NULL);
-ALTER TABLE messages ADD COLUMN IF NOT EXISTS (bocha_sum JSON NULL);
-ALTER TABLE session_files ADD COLUMN IF NOT EXISTS (message_id BIGINT NULL);
-ALTER TABLE session_files ADD COLUMN IF NOT EXISTS (message_pair_id VARCHAR(64) NULL);
-ALTER TABLE upload_files ADD COLUMN IF NOT EXISTS (message_pair_id VARCHAR(64) NULL);
-ALTER TABLE message_shares ADD COLUMN IF NOT EXISTS (title VARCHAR(255) NOT NULL DEFAULT '');
-ALTER TABLE message_favorites ADD COLUMN IF NOT EXISTS (title VARCHAR(255) NOT NULL DEFAULT '');
+ALTER TABLE sessions ADD COLUMN (agent_ids JSON NULL DEFAULT NULL);
+ALTER TABLE messages ADD COLUMN (agent_ids JSON NULL DEFAULT NULL);
+ALTER TABLE messages ADD COLUMN (user_id VARCHAR(64) NOT NULL DEFAULT '');
+ALTER TABLE messages ADD COLUMN (success TINYINT(1) NOT NULL DEFAULT 1);
+ALTER TABLE messages ADD COLUMN (tokens INT NOT NULL DEFAULT 0);
+ALTER TABLE upload_files ADD COLUMN (user_id VARCHAR(64) NOT NULL DEFAULT '');
+ALTER TABLE upload_files ADD COLUMN (file_size BIGINT NOT NULL DEFAULT 0);
+ALTER TABLE messages ADD COLUMN (message_pair_id VARCHAR(64) NULL DEFAULT NULL);
+ALTER TABLE messages ADD COLUMN (citations JSON NULL);
+ALTER TABLE messages ADD COLUMN (bocha_sum JSON NULL);
+-- 有序内容片段（text / custom_component / feedback_component），前端刷新后按序渲染
+ALTER TABLE messages ADD COLUMN (content_parts JSON NULL);
+ALTER TABLE session_files ADD COLUMN (message_id BIGINT NULL);
+ALTER TABLE session_files ADD COLUMN (message_pair_id VARCHAR(64) NULL);
+ALTER TABLE upload_files ADD COLUMN (message_pair_id VARCHAR(64) NULL);
+ALTER TABLE message_shares ADD COLUMN (title VARCHAR(255) NOT NULL DEFAULT '');
+ALTER TABLE message_favorites ADD COLUMN (title VARCHAR(255) NOT NULL DEFAULT '');
 
 -- 存量回填：按所属会话反查上传者（幂等；会话已删除的孤儿记录保持空串，不误归属）
 UPDATE upload_files uf
@@ -240,3 +243,4 @@ def _split_statements(sql: str) -> list:
         if remaining:
             statements.append(remaining)
     return statements
+

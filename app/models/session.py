@@ -14,6 +14,8 @@ class SessionMessage(BaseModel):
     message_pair_id: Optional[str] = None
     citations: List[Any] = []
     bocha_sum: List[Any] = []
+    # 有序内容片段（text / custom_component / feedback_component），前端按序渲染
+    content_parts: List[Any] = []
 
 
 class SessionFile(BaseModel):

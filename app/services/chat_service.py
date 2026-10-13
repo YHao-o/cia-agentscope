@@ -203,6 +203,7 @@ async def _persist_conversation_history(
     message_pair_id: Optional[str] = None,
     citations: Optional[List[dict]] = None,
     bocha_sum: Optional[List[dict]] = None,
+    content_parts: Optional[List[dict]] = None,
 ) -> Optional[dict]:
     """持久化本轮对话历史（用户输入 + 智能体输出）。
 
@@ -278,6 +279,7 @@ async def _persist_conversation_history(
                 "message_pair_id": message_pair_id,
                 "citations": citations if citations else None,
                 "bocha_sum": bocha_sum if bocha_sum else None,
+                "content_parts": content_parts if content_parts else None,
             })
         if new_messages:
             persist_result = await session_service.append_messages(
@@ -551,6 +553,13 @@ async def generate_response(
     collected_citations: List[dict] = []
     # 博查搜索来源摘要（从编排流 bocha_sum 事件累积，随 assistant 消息落库）
     collected_bocha_sum: List[dict] = []
+    # 有序内容片段（随 assistant 消息落库 content_parts JSON 列）：
+    # text part 来自正文流式 TEXT_BLOCK_DELTA（与组件保持真实穿插顺序），
+    # custom_component part 来自工具结果流提取的组件；
+    # 整轮无正文流（降级链路只发 summary）时结束时用 summary 兜底补 text
+    collected_content_parts: List[dict] = []
+    # 本轮是否收到过正文流式 delta（TEXT_BLOCK_DELTA）
+    text_delta_seen = False
     # 本轮编排流是否出现过 error 事件（前端文案兜底 + 落库兜底的触发标志）
     error_occurred = False
     # 兜底输出：当无 summary 时（如 pipeline 失败终止、react 无 action 终止），
@@ -678,6 +687,23 @@ async def generate_response(
                         if event_type == "summary":
                             final_output_parts.append(payload.get("content", ""))
 
+                        if event_type == "TEXT_BLOCK_DELTA":
+                            # 正文流式增量收为 text part：追加到尾部 text part，
+                            # 组件 part 会自然把前后正文切成两段，保持真实穿插顺序
+                            _text_delta = payload.get("delta", "")
+                            if _text_delta:
+                                text_delta_seen = True
+                                if (
+                                    collected_content_parts
+                                    and collected_content_parts[-1]["type"] == "text"
+                                ):
+                                    collected_content_parts[-1]["content"] += _text_delta
+                                else:
+                                    collected_content_parts.append({
+                                        "type": "text",
+                                        "content": _text_delta,
+                                    })
+
                         if event_type == "policy_qa_citations":
                             collected_citations.extend(payload.get("citations") or [])
 
@@ -694,6 +720,16 @@ async def generate_response(
                             delta = payload.get("delta", "")
                             for component in _extract_components_from_delta(delta):
                                 yield f"data: {json.dumps(component, ensure_ascii=False)}\n\n"
+                                # 组件按 SSE 发生顺序记入 content_parts（type 区分
+                                # custom_component / feedback_component，component 为本体）
+                                collected_content_parts.append({
+                                    "type": (
+                                        "feedback_component"
+                                        if component.get("type") == "FEEDBACK_COMPONENT"
+                                        else "custom_component"
+                                    ),
+                                    "component": component.get("component"),
+                                })
                     except Exception:
                         logger.debug("[chat_service] 事件解析跳过", exc_info=True)
 
@@ -705,6 +741,14 @@ async def generate_response(
             # （success=False 由编排层派生）
             if not final_output and error_occurred:
                 final_output = _FRIENDLY_ERROR_MESSAGE
+
+            # content_parts 兜底：整轮没收到正文流式 delta（降级链路只发
+            # summary）时，用 final_output 补一个 text part，保证不缺正文
+            if not text_delta_seen and final_output:
+                collected_content_parts.append({
+                    "type": "text",
+                    "content": final_output,
+                })
 
             # 编排流结束后的取消检查（避免后续步骤继续执行）
             if _cancelled():
@@ -741,6 +785,7 @@ async def generate_response(
                 message_pair_id=message_pair_id,
                 citations=collected_citations,
                 bocha_sum=collected_bocha_sum,
+                content_parts=collected_content_parts,
             )
 
             # ⑦ 检测本轮新文件
@@ -781,6 +826,7 @@ async def generate_response(
                 message_pair_id=message_pair_id,
                 citations=collected_citations,
                 bocha_sum=collected_bocha_sum,
+                content_parts=collected_content_parts,
             )
             # _persist 内部读 orchestrator_service.last_success（单例，不可信），补 UPDATE 强制失败
             if session_service and session_id and user_id:

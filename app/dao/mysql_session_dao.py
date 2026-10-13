@@ -147,7 +147,8 @@ class SessionDAO:
             async with conn.cursor(aiomysql.DictCursor) as cur:
                 await cur.execute(
                     "SELECT role, content, timestamp, agent_ids, user_id, "
-                    "success, tokens, message_pair_id, citations, bocha_sum "
+                    "success, tokens, message_pair_id, citations, bocha_sum, "
+                    "content_parts "
                     "FROM messages "
                     "WHERE session_id = %s ORDER BY id ASC",
                     (session_id,),
@@ -170,6 +171,7 @@ class SessionDAO:
                         "message_pair_id": r.get("message_pair_id"),
                         "citations": _parse_json_list(r.get("citations")),
                         "bocha_sum": _parse_json_list(r.get("bocha_sum")),
+                        "content_parts": _parse_json_list(r.get("content_parts")),
                     }
                     for r in rows
                 ]
@@ -268,17 +270,25 @@ class SessionDAO:
                             if isinstance(bocha_sum, list) and bocha_sum
                             else None
                         )
+                        content_parts = msg.get("content_parts")
+                        content_parts_json = (
+                            json.dumps(content_parts, ensure_ascii=False)
+                            if isinstance(content_parts, list) and content_parts
+                            else None
+                        )
                         await cur.execute(
                             "INSERT INTO messages "
                             "(session_id, role, content, timestamp, agent_ids, "
-                            "user_id, success, tokens, message_pair_id, citations, bocha_sum) "
-                            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
+                            "user_id, success, tokens, message_pair_id, citations, "
+                            "bocha_sum, content_parts) "
+                            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)",
                             (session_id, msg.get("role", "user"),
                              msg.get("content", ""), ts, agent_ids_json,
                              msg.get("user_id", ""),
                              int(bool(msg.get("success", True))),
                              int(msg.get("tokens", 0) or 0),
-                             msg_pair_id, citations_json, bocha_sum_json),
+                             msg_pair_id, citations_json, bocha_sum_json,
+                             content_parts_json),
                         )
                         if msg.get("role") == "user" and user_message_id is None:
                             user_message_id = cur.lastrowid
