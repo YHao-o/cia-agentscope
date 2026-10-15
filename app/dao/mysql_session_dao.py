@@ -217,15 +217,18 @@ class SessionDAO:
                     )
                     row = await cur.fetchone()
 
-                    if not row:
-                        name = ""
+                    # 从本轮 user 消息提取会话名（首条 user 文本前 50 字符）
+                    def _first_user_name() -> str:
                         for msg in new_messages:
                             if msg.get("role") == "user":
                                 raw_text = msg.get("content", "")
-                                name = (
+                                return (
                                     raw_text[:50] if len(raw_text) > 50 else raw_text
                                 )
-                                break
+                        return ""
+
+                    if not row:
+                        name = _first_user_name()
                         agent_ids_init = (
                             json.dumps(agent_ids_all, ensure_ascii=False)
                             if agent_ids_all else None
@@ -236,6 +239,17 @@ class SessionDAO:
                             "VALUES (%s, %s, %s, %s, %s, %s)",
                             (session_id, user_id, name, now, now, agent_ids_init),
                         )
+                    elif not (row.get("name") or "").strip():
+                        # 会话行已存在但 name 为空（如 save_agent_state 先建的
+                        # 空名行），用本轮 user 消息补写，避免会话名永远停留在
+                        # "未命名对话"。仅空名补写，不改用户已命名的会话。
+                        backfill_name = _first_user_name()
+                        if backfill_name:
+                            await cur.execute(
+                                "UPDATE sessions SET name = %s, updated_at = %s "
+                                "WHERE session_id = %s AND (name IS NULL OR name = '')",
+                                (backfill_name, now, session_id),
+                            )
 
                     # 2) 插入消息（含 agent_ids），记录本轮 user/assistant
                     #    消息的自增 id

@@ -63,6 +63,10 @@ def _format_search_results(bocha_sum: list) -> str:
         if summary:
             lines.append(summary)
         lines.append(f"链接: {s['url']}")
+    lines.append(
+        "\n请在回答正文中用 {n} 序号标注引用来源（n 对应上述 [n] 编号），"
+        "不要在正文中罗列完整链接。"
+    )
     return "\n".join(lines)
 
 

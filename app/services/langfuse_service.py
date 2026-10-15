@@ -61,11 +61,14 @@ class LangfuseService:
         usage_details: Optional[dict] = None,
         level: Optional[str] = None,
         status_message: Optional[str] = None,
+        input: Any = None,
     ) -> None:
         if not self._enabled or not observation:
             return
         try:
             kwargs: dict = {"output": output}
+            if input is not None:
+                kwargs["input"] = input
             if usage_details:
                 kwargs["usage_details"] = usage_details
             if level:

@@ -19,6 +19,7 @@ from agentscope.state import AgentState
 from agentscope.tool import Toolkit
 
 from app.agents.base import AgentDefinition
+from app.intent.rewriter import _get_current_date_str
 
 logger = logging.getLogger(__name__)
 
@@ -229,6 +230,7 @@ class AgentRegistry:
         agent = Agent(
             name=definition.name,
             system_prompt=definition.system_prompt
+            + f"\n当前时间：{_get_current_date_str()}。涉及\"今天/本周/最近\"等时间表述时以此为准。"
             + f"\n注意当前工作区目录是/data/workspaces/{session_id}，你只能在该目录下创建/编辑文件，绝不允许修改目录以外的文件！"
             + "\n用户上传的文件不会出现在工作区目录中：其内容已解析并直接附在用户问题里，请直接阅读使用，不要尝试在工作区中查找用户附件。"
             + "\n当你生成文件时，生成的文件内容只要用户不做特殊说明应该以中文为主。"

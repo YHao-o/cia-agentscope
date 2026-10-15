@@ -428,6 +428,24 @@ def load_model_config(config_path: str = MODEL_CONFIG_PATH) -> dict:
         return yaml.safe_load(f)
 
 
+class _PatchedOpenAIChatModel(OpenAIChatModel):
+    """OpenAIChatModel 补丁：结构化输出降级名单纳入泛型 openai.APIError。
+
+    私有推理引擎（SGLang/vLLM 系）对 forced tool_choice 的 JSON schema
+    编译 grammar 失败时，可能以非标准形态（如 200 + error body）抛
+    openai.APIError 而非标准 400 BadRequestError，导致 agentscope 内置
+    的四级 structured-output 降级链在第一级即中断，上下文压缩等
+    结构化调用硬失败。将 APIError（BadRequestError 的父类）纳入降级
+    名单后，forced 级失败会自动降级到无 tool_choice 的 "none" 级
+    （不触发引擎 grammar 编译，靠提示词输出 JSON），绕开引擎 bug。
+    """
+
+    @classmethod
+    def _get_structured_output_fallback_exceptions(cls):
+        import openai
+        return (openai.APIError,)
+
+
 def create_model_from_config(model_config: dict, message_pair_id: str = ""):
     """根据配置创建模型实例（业务智能体流式对话用）。
 
@@ -456,7 +474,7 @@ def create_model_from_config(model_config: dict, message_pair_id: str = ""):
             }}
             if message_pair_id else None
         )
-        model = OpenAIChatModel(
+        model = _PatchedOpenAIChatModel(
             credential=credential,
             model=model_name,
             stream=True,
@@ -551,7 +569,8 @@ async def generate_response(
     final_output_parts: List[str] = []
     # 制度问答引用（从编排流 policy_qa_citations 事件累积，随 assistant 消息落库）
     collected_citations: List[dict] = []
-    # 博查搜索来源摘要（从编排流 bocha_sum 事件累积，随 assistant 消息落库）
+    # 博查搜索来源摘要（bocha_sum 事件为全量快照语义，覆盖取最后一个事件，
+    # 随 assistant 消息落库）
     collected_bocha_sum: List[dict] = []
     # 有序内容片段（随 assistant 消息落库 content_parts JSON 列）：
     # text part 来自正文流式 TEXT_BLOCK_DELTA（与组件保持真实穿插顺序），
@@ -708,7 +727,9 @@ async def generate_response(
                             collected_citations.extend(payload.get("citations") or [])
 
                         if event_type == "bocha_sum":
-                            collected_bocha_sum.extend(payload.get("bocha_sum") or [])
+                            # 事件为"全量快照"语义（每事件携带累积全量列表），
+                            # 覆盖取最后一个事件即可，extend 会造成来源重复
+                            collected_bocha_sum = payload.get("bocha_sum") or []
 
                         # 兜底收集失败终止事件的文本（仅当无 summary 时才启用）
                         if event_type == "pipeline_intercept":

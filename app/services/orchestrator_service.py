@@ -453,7 +453,11 @@ class OrchestratorService:
         ) as agent_span:
             from app.utils.agent_event_tracer import AgentEventTracer
             from app.utils.agent_event_stream import iter_agent_events
-            tracer = AgentEventTracer(langfuse_service, agent_id)
+            from agentscope.event import ToolResultEndEvent as _ToolResultEnd
+            tracer = AgentEventTracer(langfuse_service, agent_id, agent=agent)
+            # 已下发 bocha_sum 累积：每次事件发"全量快照"而非增量，
+            # 多次搜索时前端覆盖式渲染仍得到完整来源列表（与流末单事件语义兼容）
+            bocha_emitted: list = []
             try:
                 def _on_reply_start(ev):
                     nonlocal apply
@@ -465,6 +469,23 @@ class OrchestratorService:
                     if apply:
                         apply.append_event(event)
                     yield f"data: {event.model_dump_json()}\n\n"
+                    # 工具一结束立即下发 bocha_sum：正文 {n} 标注依赖来源列表，
+                    # 先于正文 delta 到达前端，便于边渲染正文边映射引用
+                    if isinstance(event, _ToolResultEnd):
+                        early_bocha = tracer.consume_bocha_sum()
+                        if early_bocha:
+                            bocha_emitted.extend(early_bocha)
+                            yield (
+                                "data: "
+                                + json.dumps(
+                                    {
+                                        "type": "bocha_sum",
+                                        "bocha_sum": bocha_emitted,
+                                    },
+                                    ensure_ascii=False,
+                                )
+                                + "\n\n"
+                            )
 
                 if apply:
                     text_parts = []
@@ -494,15 +515,17 @@ class OrchestratorService:
                         + "\n\n"
                     )
 
-                # emit 工具执行期间捕获的 bocha_sum（博查搜索来源摘要）
-                bocha_sum = tracer.consume_bocha_sum()
-                if bocha_sum:
+                # emit 流末残余的 bocha_sum：循环内 consume 之后新捕获的部分
+                # 合并进快照累积再发全量；已发过且无残余时不再重复发（最后一个事件已含全量）
+                residual_bocha = tracer.consume_bocha_sum()
+                if residual_bocha:
+                    bocha_emitted.extend(residual_bocha)
                     yield (
                         "data: "
                         + json.dumps(
                             {
                                 "type": "bocha_sum",
-                                "bocha_sum": bocha_sum,
+                                "bocha_sum": bocha_emitted,
                             },
                             ensure_ascii=False,
                         )
