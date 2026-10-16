@@ -1,4 +1,4 @@
-﻿"""MySQL 建表初始化。"""
+"""MySQL 建表初始化。"""
 import logging
 
 import aiomysql
@@ -47,6 +47,10 @@ CREATE TABLE IF NOT EXISTS messages (
     citations       JSON NULL,
     bocha_sum       JSON NULL,
     content_parts   JSON NULL,
+    -- 点赞点踩：1=赞 0=踩 NULL=未反馈（仅 assistant 行；按 message_pair_id 定位本轮回复）
+    feedback       TINYINT(1) NULL DEFAULT NULL,
+    -- 反馈评价内容（点踩后用户填写的文字说明，随 feedback 一同覆盖更新）
+    feedback_comment VARCHAR(1024) NULL DEFAULT NULL,
     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
@@ -177,6 +181,8 @@ ALTER TABLE messages ADD COLUMN (citations JSON NULL);
 ALTER TABLE messages ADD COLUMN (bocha_sum JSON NULL);
 -- 有序内容片段（text / custom_component / feedback_component），前端刷新后按序渲染
 ALTER TABLE messages ADD COLUMN (content_parts JSON NULL);
+ALTER TABLE messages ADD COLUMN (feedback TINYINT(1) NULL DEFAULT NULL);
+ALTER TABLE messages ADD COLUMN (feedback_comment VARCHAR(1024) NULL DEFAULT NULL);
 ALTER TABLE session_files ADD COLUMN (message_id BIGINT NULL);
 ALTER TABLE session_files ADD COLUMN (message_pair_id VARCHAR(64) NULL);
 ALTER TABLE upload_files ADD COLUMN (message_pair_id VARCHAR(64) NULL);

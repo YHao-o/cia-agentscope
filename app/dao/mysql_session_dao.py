@@ -148,7 +148,7 @@ class SessionDAO:
                 await cur.execute(
                     "SELECT role, content, timestamp, agent_ids, user_id, "
                     "success, tokens, message_pair_id, citations, bocha_sum, "
-                    "content_parts "
+                    "content_parts, feedback, feedback_comment "
                     "FROM messages "
                     "WHERE session_id = %s ORDER BY id ASC",
                     (session_id,),
@@ -172,6 +172,12 @@ class SessionDAO:
                         "citations": _parse_json_list(r.get("citations")),
                         "bocha_sum": _parse_json_list(r.get("bocha_sum")),
                         "content_parts": _parse_json_list(r.get("content_parts")),
+                        "feedback": (
+                            int(r["feedback"])
+                            if r.get("feedback") is not None
+                            else None
+                        ),
+                        "feedback_comment": r.get("feedback_comment"),
                     }
                     for r in rows
                 ]
@@ -400,6 +406,34 @@ class SessionDAO:
                     (session_id, user_id, session_id, user_id),
                 )
                 await conn.commit()
+
+    async def update_message_feedback(
+        self,
+        session_id: str,
+        user_id: str,
+        message_pair_id: str,
+        feedback: int,
+        comment: Optional[str] = None,
+    ) -> int:
+        """点赞点踩落库：按 (session_id, message_pair_id) 定位本轮 assistant
+        消息行写入 feedback（1=赞 0=踩）与 feedback_comment（评价内容）。
+        行级 user_id 条件防越权。覆盖语义：本次提交的 comment 覆盖旧值
+        （未填则清空）。
+
+        多智能体一轮产生多条 assistant 行时全部更新（本轮回复整体反馈）。
+        返回更新行数；0 表示消息不存在或不属于当前用户。
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(
+                    "UPDATE messages SET feedback = %s, feedback_comment = %s "
+                    "WHERE session_id = %s AND user_id = %s "
+                    "AND message_pair_id = %s AND role = 'assistant'",
+                    (int(feedback), comment, session_id, user_id, message_pair_id),
+                )
+                updated = cur.rowcount
+                await conn.commit()
+                return updated
 
     # ================================================================
     # Session 元信息
