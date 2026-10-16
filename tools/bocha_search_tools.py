@@ -94,7 +94,10 @@ def create_bocha_search_tool() -> FunctionTool:
         if not BOCHA_API_KEY:
             return _build_result("搜索服务未配置，请联系管理员。")
 
-        url = f"{BOCHA_API_BASE.rstrip('/')}"
+        # 兼容两种配置语义：BOCHA_API_BASE 配域名根（自动拼 /v1/web-search）
+        # 或配完整接口 URL（原样使用），避免配置缺路径导致 404。
+        base = BOCHA_API_BASE.rstrip("/")
+        url = base if base.endswith("/web-search") else f"{base}/v1/web-search"
         headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {BOCHA_API_KEY}",

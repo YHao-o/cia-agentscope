@@ -95,7 +95,7 @@ _MOCK_USERS = {
                         "code": "aisearch_mcp",
                         "transport_type": "streamable_http",
                         "transport_url": "https://qianfan.baidubce.com/v2/ai_search/mcp",
-                        "authorization": "Bearer token",
+                        "authorization": "Bearer xxx",
                     },
                 },
             ],

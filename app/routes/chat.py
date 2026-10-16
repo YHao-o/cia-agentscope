@@ -124,6 +124,7 @@ async def chat(request: Request, body: ChatRequest, user: dict = Depends(current
                 request=request,
                 search_enabled=body.search_enabled,
                 skills=body.skills,
+                knowledge_bases=body.knowledge_bases,
                 cancel_event=cancel_event,
                 workspace_manager=getattr(request.app.state, "workspace_manager", None),
             )):

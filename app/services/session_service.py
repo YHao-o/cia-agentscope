@@ -3,6 +3,7 @@ import uuid
 from typing import List, Optional
 
 from agentscope.state import AgentState
+from fastapi import HTTPException
 
 from app.models.session import (
     SessionMeta,
@@ -29,8 +30,19 @@ class SessionService:
         self.upload_file_dao = upload_file_dao
 
     async def get_or_create_session(self, session_id: Optional[str], user_id: str) -> str:
-        """获取已有 session_id 或创建新会话。"""
+        """获取已有 session_id 或创建新会话。
+
+        安全：session_id 已存在（sessions 表有记录）时校验归属，
+        非本人会话 → 403，防止通过他人会话 ID 加载/污染其对话历史。
+        """
         if session_id:
+            meta = await self.dao.get_session_meta(session_id)
+            if meta is not None and str(meta.get("user_id") or "") != str(user_id):
+                logger.warning(
+                    f"[session] 越权拦截 session={session_id} "
+                    f"owner={meta.get('user_id')} caller={user_id}"
+                )
+                raise HTTPException(status_code=403, detail="无权访问该会话")
             return session_id
         return uuid.uuid4().hex
 

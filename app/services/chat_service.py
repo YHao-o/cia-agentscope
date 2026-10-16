@@ -465,8 +465,19 @@ def create_model_from_config(model_config: dict, message_pair_id: str = ""):
 
     if provider == "openai":
         credential = OpenAICredential(api_key=api_key, base_url=base_url)
+        # 上下文窗口独立配置：优先 context_size（模型真实窗口，决定压缩阈值），
+        # 缺省回退 max_tokens（兼容旧配置）。两者语义不同：
+        # max_tokens 是单次输出上限，会作为请求参数发给 API；
+        # context_size 只用于本地 token 估算与压缩触发判断。
+        raw_ctx = parameters.pop("context_size", None) or model_config.get(
+            "context_size",
+        )
         max_tokens = parameters.get("max_tokens", 0)
-        context_size = int(max_tokens) if max_tokens else None
+        context_size = (
+            int(raw_ctx)
+            if raw_ctx
+            else (int(max_tokens) if max_tokens else None)
+        )
         # 每轮对话附加请求头：app_serial_number = OIA-AGENTSCOPE-{message_pair_id}
         client_kwargs = (
             {"default_headers": {
@@ -547,6 +558,7 @@ async def generate_response(
     request=None,
     search_enabled: bool = True,
     skills: List[str] = None,
+    knowledge_bases: List[str] = None,
     cancel_event: Optional[asyncio.Event] = None,
     workspace_manager: Any = None,
 ) -> AsyncGenerator[str, None]:
@@ -659,6 +671,7 @@ async def generate_response(
                 request=request,
                 search_enabled=search_enabled,
                 skills=skills or [],
+                knowledge_bases=knowledge_bases or [],
                 langfuse_service=langfuse_service,
                 message_pair_id=message_pair_id,
             ):

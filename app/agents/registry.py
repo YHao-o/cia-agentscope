@@ -247,4 +247,17 @@ class AgentRegistry:
             ),
             react_config=react_config
         )
+        # 压缩防护：私有引擎对结构化输出的 grammar 编译 bug 会导致
+        # 自动压缩抛 APIError（2.0.3 无降级梯子，异常直接炸掉整个会话）。
+        # 包装为软失败：压缩失败仅跳过本轮压缩，对话继续。
+        _orig_compress = agent.compress_context
+
+        async def _safe_compress_context(*args, **kwargs):
+            try:
+                return await _orig_compress(*args, **kwargs)
+            except Exception as e:
+                logger.warning("[AgentRegistry] 上下文压缩失败，已跳过: %s", e)
+                return None
+
+        agent.compress_context = _safe_compress_context
         return agent

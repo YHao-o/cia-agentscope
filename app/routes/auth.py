@@ -27,6 +27,7 @@ from app.services.auth_service import (
     save_user_permissions,
     get_user_permissions,
 )
+from tools.policy_qa_tools import resolve_user_kb_names
 from app.config import JWT_EXPIRE_HOURS, JWT_REFRESH_EXPIRE_DAYS
 
 router = APIRouter()
@@ -157,6 +158,24 @@ def _normalize_agent_access(agent_access: list) -> list:
     return normalized
 
 
+def _build_agent_access(permissions: dict) -> list:
+    """agent_access 统一构造：合并制度问答项 → 清洗 → 注入可选知识库名。
+
+    在合并出的 regulations_agent 项上追加 knowledge_bases（用户可访问的
+    知识库名列表，即 POLICY_QA_KB_MAP 匹配键，供前端渲染知识库选择器）；
+    无制度问答合并项时原样返回（非制度问答用户零感知）。
+    登录/注册与 refresh/改资料响应共用，保证结构逐字段一致。
+    """
+    agent_access = _normalize_agent_access(
+        _merge_regulations_agents(permissions.get("agent_whitelist", []))
+    )
+    for item in agent_access:
+        if isinstance(item, dict) and item.get("id") == "regulations_agent":
+            item["knowledge_bases"] = resolve_user_kb_names(permissions)
+            break
+    return agent_access
+
+
 async def _build_auth_success(result: dict, request: Request) -> dict:
     """登录/注册成功后的统一处理：存 Redis 权限 → 生成 JWT → 构造前端响应。
 
@@ -226,9 +245,7 @@ async def _build_auth_success(result: dict, request: Request) -> dict:
         "refresh_token": refresh_token,
         "refresh_expires_in": JWT_REFRESH_EXPIRE_DAYS * 86400,
         "user_info": user_info,
-        "agent_access": _normalize_agent_access(
-            _merge_regulations_agents(permissions["agent_whitelist"])
-        ),
+        "agent_access": _build_agent_access(permissions),
         "skill_blacklist": permissions["skill_blacklist"],
         "optional_skills": _OPTIONAL_SKILLS,
     })
@@ -303,9 +320,7 @@ async def _build_update_response(request: Request, user: dict, updates: dict) ->
         "token_type": "bearer",
         "expires_in": JWT_EXPIRE_HOURS * 3600,
         "user_info": user_info,
-        "agent_access": _normalize_agent_access(
-            _merge_regulations_agents(permissions.get("agent_whitelist", []))
-        ),
+        "agent_access": _build_agent_access(permissions),
         "skill_blacklist": permissions.get("skill_blacklist", []),
         "optional_skills": _OPTIONAL_SKILLS,
     })
@@ -378,9 +393,7 @@ async def refresh_token(request: Request, body: RefreshRequest):
         "token_type": "bearer",
         "expires_in": JWT_EXPIRE_HOURS * 3600,
         "user_info": user_info,
-        "agent_access": _normalize_agent_access(
-            _merge_regulations_agents(permissions.get("agent_whitelist", []))
-        ),
+        "agent_access": _build_agent_access(permissions),
         "skill_blacklist": permissions.get("skill_blacklist", []),
         "optional_skills": _OPTIONAL_SKILLS,
     })

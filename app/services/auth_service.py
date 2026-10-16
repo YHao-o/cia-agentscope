@@ -24,8 +24,15 @@ def create_access_token(payload: dict, expire_hours: int = JWT_EXPIRE_HOURS) -> 
 
 
 def decode_access_token(token: str) -> dict:
-    """解析 JWT; 过期或签名错误时抛出 jwt 异常。"""
-    return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    """解析 JWT; 过期或签名错误时抛出 jwt 异常。
+
+    安全：拒绝 refresh token 直接作为接口访问凭证
+    （refresh token 有效期长，仅可用于 POST /refresh 换发新 token）。
+    """
+    payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    if payload.get("type") == "refresh":
+        raise jwt.InvalidTokenError("refresh token 不能用于接口鉴权")
+    return payload
 
 
 def create_refresh_token(payload: dict, expire_days: int = JWT_REFRESH_EXPIRE_DAYS) -> str:

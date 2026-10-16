@@ -30,6 +30,7 @@ async def assemble_workspace_components(
     session_id_safe: str,
     search_enabled: bool = True,
     skills: Optional[List[str]] = None,
+    knowledge_bases: Optional[List[str]] = None,
     langfuse_service: Optional[Any] = None,
 ) -> tuple:
     """获取/创建工作区并组装注册表与工厂（依赖沙箱，可与意图链路并行）。
@@ -90,8 +91,13 @@ async def assemble_workspace_components(
         FunctionTool(render_metric_card), FunctionTool(render_confirm_action),
         FunctionTool(render_indicator_table), FunctionTool(render_selectable_list),
     ]
-    # 制度问答工具（宿主侧 FunctionTool，知识库 ID 由用户权限自动映射，不依赖工作区后端）
-    policy_qa_tool = create_policy_qa_tool(user_id=user_id, redis_client=redis_client)
+    # 制度问答工具（宿主侧 FunctionTool，知识库 ID 由用户权限自动映射，
+    # 不依赖工作区后端；knowledge_bases 为前端所选知识库名，空 = 全选）
+    policy_qa_tool = create_policy_qa_tool(
+        user_id=user_id,
+        redis_client=redis_client,
+        knowledge_bases=knowledge_bases,
+    )
     # 卡片反馈工具（同轮暂停-恢复，闭包注入 session_id）
     feedback_tool = create_feedback_tool(session_id=session_id_safe)
 

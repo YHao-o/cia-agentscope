@@ -22,7 +22,7 @@ from fastapi import Request
 from openai import AsyncOpenAI
 
 from agentscope.state import AgentState
-from agentscope.message import AssistantMsg, UserMsg
+from agentscope.message import AssistantMsg, TextBlock, UserMsg
 
 from app.config import INTENT_CONFIG_PATH
 from app.agents.factory import AgentFactory
@@ -358,6 +358,7 @@ class OrchestratorService:
         session_id_safe: str,
         search_enabled: bool = True,
         skills: Optional[List[str]] = None,
+        knowledge_bases: Optional[List[str]] = None,
         langfuse_service: Optional[Any] = None,
         message_pair_id: Optional[str] = None,
     ) -> tuple:
@@ -381,6 +382,7 @@ class OrchestratorService:
             session_id_safe=session_id_safe,
             search_enabled=search_enabled,
             skills=skills,
+            knowledge_bases=knowledge_bases,
             langfuse_service=langfuse_service,
         )
 
@@ -442,7 +444,7 @@ class OrchestratorService:
             return
 
         # 执行单 agent 对话（span 内流式执行）
-        user_msg = UserMsg(name="user", content=user_input)
+        user_msg = UserMsg(name="user", content=[TextBlock(text=user_input)])
         apply = None
         final_output_parts: List[str] = []
 
@@ -572,6 +574,7 @@ class OrchestratorService:
         search_enabled: bool = True,
         langfuse_service: Optional[Any] = None,
         skills: Optional[List[str]] = None,
+        knowledge_bases: Optional[List[str]] = None,
         message_pair_id: Optional[str] = None,
     ) -> AsyncGenerator[str, None]:
         """编排主流程：改写 → 识别 → 选择编排器 → 执行。
@@ -588,6 +591,8 @@ class OrchestratorService:
             session_service: 会话服务
             agent_id: 可选，指定后走单智能体直接问答
             request: FastAPI Request 对象（用于访问 app.state.redis_client）
+            knowledge_bases: 前端所选知识库名列表（制度问答），
+                空 = 全选；透传给 policy_qa 工具闭包做检索范围过滤
             message_pair_id: 本轮对话配对 id（非空时业务智能体 LLM 请求
                 带 app_serial_number 请求头）
 
@@ -636,6 +641,7 @@ class OrchestratorService:
                 session_id_safe=session_id_safe,
                 search_enabled=search_enabled,
                 skills=skills or [],
+                knowledge_bases=knowledge_bases or [],
                 langfuse_service=langfuse_service,
                 message_pair_id=message_pair_id,
             ),

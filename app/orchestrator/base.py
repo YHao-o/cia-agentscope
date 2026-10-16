@@ -8,7 +8,7 @@ from typing import Any, AsyncGenerator, Dict, Iterator, List, Optional, Union
 from pydantic import BaseModel, Field
 
 from agentscope.event import AgentEvent, ReplyStartEvent
-from agentscope.message import AssistantMsg, UserMsg
+from agentscope.message import AssistantMsg, TextBlock, UserMsg
 from agentscope.state import AgentState
 
 from app.agents.factory import AgentFactory
@@ -96,7 +96,7 @@ class BaseOrchestrator(ABC):
         if prior_context:
             user_content = f"[前置参考信息]\n{prior_context}\n\n[你的任务]\n{intent.query}"
 
-        user_msg = UserMsg(name="user", content=user_content)
+        user_msg = UserMsg(name="user", content=[TextBlock(text=user_content)])
 
         result = TaskResult(intent_id=intent.id, agent_id=agent_id)
         apply = None
