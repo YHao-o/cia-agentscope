@@ -292,8 +292,16 @@ class OpenSandboxWorkspaceManager:
         if entry is not None:
             try:
                 await entry.sandbox.destroy()
-            except Exception:
-                logger.exception(f"[opensandbox_ws] 销毁沙箱失败 wid={wid}")
+            except Exception as e:
+                # 幂等：远端沙箱已不存在（server 侧 TTL 回收/运维清理）
+                # 视为销毁成功，不刷 ERROR 堆栈
+                msg = str(e)
+                if "SANDBOX_NOT_FOUND" in msg or "not found" in msg.lower():
+                    logger.info(
+                        f"[opensandbox_ws] 远端沙箱已不存在，视为已销毁 wid={wid}"
+                    )
+                else:
+                    logger.exception(f"[opensandbox_ws] 销毁沙箱失败 wid={wid}")
             logger.info(f"[opensandbox_ws] 淘汰工作区 wid={wid}")
 
     async def _evict(self, wid: str) -> None:

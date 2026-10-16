@@ -123,12 +123,13 @@ class SessionDAO:
                         )
 
                     # 2) UPSERT agent_states（ON DUPLICATE KEY UPDATE）
+                    # 行别名语法替代 VALUES(col)（MySQL 8.0.20+ 已弃用）
                     await cur.execute(
                         "INSERT INTO agent_states "
                         "(session_id, agent_id, state, updated_at) "
-                        "VALUES (%s, %s, %s, %s) "
+                        "VALUES (%s, %s, %s, %s) AS new "
                         "ON DUPLICATE KEY UPDATE "
-                        "state = VALUES(state), updated_at = VALUES(updated_at)",
+                        "state = new.state, updated_at = new.updated_at",
                         (session_id, agent_id, state_json, now),
                     )
 
@@ -679,12 +680,12 @@ class SessionDAO:
                             "INSERT INTO session_files "
                             "(session_id, name, path, url, size, media_type, "
                             "message_id, message_pair_id) "
-                            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) "
+                            "VALUES (%s, %s, %s, %s, %s, %s, %s, %s) AS new "
                             "ON DUPLICATE KEY UPDATE "
-                            "name = VALUES(name), url = VALUES(url), "
-                            "size = VALUES(size), media_type = VALUES(media_type), "
-                            "message_id = VALUES(message_id), "
-                            "message_pair_id = VALUES(message_pair_id), "
+                            "name = new.name, url = new.url, "
+                            "size = new.size, media_type = new.media_type, "
+                            "message_id = new.message_id, "
+                            "message_pair_id = new.message_pair_id, "
                             "updated_at = NOW()",
                             (
                                 session_id,
@@ -806,14 +807,14 @@ class SessionDAO:
                             "VALUES (%s, %s, '', %s, %s)",
                             (session_id, user_id, now, now),
                         )
-                    # UPSERT agent_states
+                    # UPSERT agent_states（行别名语法，VALUES(col) 已弃用）
                     await cur.execute(
                         "INSERT INTO agent_states "
                         "(session_id, agent_id, state, updated_at) "
-                        "VALUES (%s, %s, %s, %s) "
+                        "VALUES (%s, %s, %s, %s) AS new "
                         "ON DUPLICATE KEY UPDATE "
-                        "state = VALUES(state), "
-                        "updated_at = VALUES(updated_at)",
+                        "state = new.state, "
+                        "updated_at = new.updated_at",
                         (session_id, agent_id, state_json, now),
                     )
                     await conn.commit()

@@ -458,7 +458,10 @@ def create_model_from_config(model_config: dict, message_pair_id: str = ""):
     base_url = model_config.get("base_url", "https://api.deepseek.com/v1")
     model_name = model_config.get("model_name", "deepseek-chat")
     api_key = model_config.get("api_key", "OPENAI_API_KEY")
-    parameters = model_config.get("parameters", {})
+    # 必须拷贝：model_config 是全局共享 dict（启动时读一次），
+    # 直接引用后 pop 会把 context_size 从全局配置里永久删掉，
+    # 导致第二次创建 model 起全部走 max_tokens 回退（阈值错乱）
+    parameters = dict(model_config.get("parameters", {}))
 
     if not api_key:
         raise ValueError("环境变量未设置")

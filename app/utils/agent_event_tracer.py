@@ -90,7 +90,21 @@ class AgentEventTracer:
                 self._collected_citations.extend(meta_citations)
             meta_bocha = meta.get("bocha_sum")
             if isinstance(meta_bocha, list) and meta_bocha:
-                self._collected_bocha_sum.extend(meta_bocha)
+                # 按 URL 去重（保序）：多轮搜索召回相同页面时仅保留首个，
+                # 避免全量快照中同来源重复展示
+                seen_urls = {
+                    item.get("url")
+                    for item in self._collected_bocha_sum
+                    if isinstance(item, dict)
+                }
+                for item in meta_bocha:
+                    if not isinstance(item, dict):
+                        continue
+                    url = item.get("url")
+                    if url and url in seen_urls:
+                        continue
+                    seen_urls.add(url)
+                    self._collected_bocha_sum.append(item)
         except Exception:
             logger.debug("[AgentEventTracer] 提取 citations 失败", exc_info=True)
 
