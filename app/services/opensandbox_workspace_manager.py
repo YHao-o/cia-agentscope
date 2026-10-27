@@ -381,6 +381,7 @@ class OpenSandboxWorkspaceManager:
 
     async def _inject_skills(self, sbx: Sandbox, skill_dirs: list[str]) -> None:
         """将宿主技能目录内容写入沙箱 /workspace/skills/ 目录。"""
+        entries: list[WriteEntry] = []
         for d in skill_dirs:
             if not d or not os.path.isdir(d):
                 logger.warning(f"[opensandbox_ws] 技能目录不存在，跳过: {d}")
@@ -390,15 +391,18 @@ class OpenSandboxWorkspaceManager:
                 for fname in files:
                     host_path = os.path.join(root, fname)
                     rel_path = os.path.relpath(host_path, d)
-                    sandbox_path = f"/workspace/skills/{skill_name}/{rel_path}"
-                    try:
-                        with open(host_path, "rb") as f:
-                            content = f.read()
-                        await sbx.files.write_files([
-                            WriteEntry(path=sandbox_path, data=content, mode=644)
-                        ])
-                    except Exception:
-                        logger.warning(f"[opensandbox_ws] 注入技能文件失败: {host_path}")
+                    with open(host_path, "rb") as f:
+                        entries.append(WriteEntry(
+                            path=f"/workspace/skills/{skill_name}/{rel_path}",
+                            data=f.read(),
+                            mode=644,
+                        ))
+        if not entries:
+            return
+        try:
+            await sbx.files.write_files(entries)
+        except Exception:
+            logger.warning(f"[opensandbox_ws] 注入技能文件失败 files={len(entries)}")
 
     async def get_workspace(
         self, user_id: str, session_id: str
@@ -610,6 +614,34 @@ class OpenSandboxWorkspaceManager:
                 exc_info=True,
             )
             return None
+
+    async def write_session_file(
+        self, user_id: str, session_id: str, rel_path: str, content: str
+    ) -> bool:
+        """把文本写入会话工作目录（上传文件解析内容落沙箱使用）。
+
+        rel_path 需为 uploads/ 下的相对路径；失败返回 False，
+        调用方静默降级，不影响问答主流程。
+        """
+        rel = self._normalize_rel(rel_path)
+        if rel is None or not content:
+            return False
+        try:
+            adapter = await self._get_adapter(user_id, session_id)
+            if adapter is None:
+                return False
+            abs_dir = f"{self._session_dir(session_id)}/uploads"
+            await adapter.bash(f"mkdir -p {abs_dir}")
+            abs_path = f"{abs_dir}/{rel.rsplit('/', 1)[-1]}"
+            await adapter.write(abs_path, content)
+            return True
+        except Exception:
+            logger.warning(
+                f"[opensandbox_ws] write_session_file 失败 "
+                f"user={user_id} session={session_id} rel={rel_path}",
+                exc_info=True,
+            )
+            return False
 
     async def stat_session_file(
         self, user_id: str, session_id: str, rel_path: str

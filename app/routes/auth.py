@@ -36,30 +36,40 @@ router = APIRouter()
 # 文档/音频解析已改为上传时后台完成（见 file_parse_service），不再作为可选技能
 _OPTIONAL_SKILLS = [
     {
-        "name": "policy_qa",
-        "nickname": "制度问答",
-        "description": "根据公司内部制度文件知识库回答问题。",
+        "name": "excel-xlsx",
+        "nickname": "Excel 表格处理",
+        "description": "创建、检查、编辑 Excel 工作簿，保障公式、日期、数据类型与格式可靠。",
     },
     {
-        "name": "deep-research",
-        "nickname": "深度调研",
-        "description": "用于系统性研究、竞品分析、方案对比、趋势分析或事实核查等等",
+        "name": "word-docx",
+        "nickname": "Word 文档处理",
+        "description": "创建、检查、编辑 Word 文档，保障样式、编号、修订与版式在编辑后不漂移。",
     },
     {
-        "name": "internal-comms",
-        "nickname": "撰写公司内部报告",
-        "description": "撰写各类内部通讯的技能。",
+        "name": "smart-charts",
+        "nickname": "智能交互图表",
+        "description": "根据数据生成可交互的 ECharts 图表（含中国/世界地图、词云），完全离线可用。",
     },
     {
-        "name": "sn-da-excel-workflow",
-        "nickname": "表格分析处理",
-        "description": "Excel分析/数据清洗/数据统计/数据筛选等等",
+        "name": "academic-figures",
+        "nickname": "学术图表绘制",
+        "description": "绘制出版级学术图表，符合期刊规范，支持中文渲染与统计图形。",
     },
     {
-        "name": "chart_renderer",
-        "nickname": "可视化图表",
-        "description": "智能图表渲染技能，根据数据特征自动选择最合适的图表类型并通过工具渲染。",
-    }
+        "name": "gongwenformat-pro",
+        "nickname": "公文格式排版",
+        "description": "按 GB/T 9704-2012 党政机关公文格式标准，对 Word 公文自动排版。",
+    },
+    {
+        "name": "unclecheng-reduce-ai-perception",
+        "nickname": "去 AI 味润色",
+        "description": "降低文本的 AI 生成痕迹，使用词、句式、结构更接近真人表达。",
+    },
+    {
+        "name": "ydxc0511",
+        "nickname": "公文材料写作",
+        "description": "发言稿、心得体会、宣传通讯等机关材料的写作模板与范文参考。",
+    },
 ]
 
 
@@ -255,7 +265,11 @@ async def _build_auth_success(result: dict, request: Request) -> dict:
 async def login(request: Request, login_req: LoginRequest):
     result = await verify_login(login_req.username, login_req.password)
     if not result.get("verification"):
-        return error_response(401, "用户名或密码错误")
+        # mng 模式下透传 mng 的 code/message；mock 失败回退 401
+        return error_response(
+            result.get("code", 401),
+            result.get("message", "用户名或密码错误"),
+        )
     return await _build_auth_success(result, request)
 
 

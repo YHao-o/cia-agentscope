@@ -15,5 +15,8 @@ spec:
       port: {{ .Values.service.port }}
       protocol: TCP
       targetPort: http
+      {{- if and (eq .Values.service.type "NodePort") .Values.service.nodePort }}
+      nodePort: {{ .Values.service.nodePort }}
+      {{- end }}
   selector:
     {{- include "cia-agentscope.selectorLabels" . | nindent 4 }}

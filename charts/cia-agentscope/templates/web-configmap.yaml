@@ -1,0 +1,68 @@
+{{- if and .Values.web.enabled (not .Values.web.nginx.existingConfigMap) }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ include "cia-agentscope.web.fullname" . }}
+  labels:
+    {{- include "cia-agentscope.web.labels" . | nindent 4 }}
+data:
+  default.conf: |
+    server {
+        listen {{ .Values.web.containerPort }};
+        server_name _;
+        root {{ .Values.web.nginx.root }};
+        index index.html;
+        client_max_body_size {{ .Values.web.clientMaxBodySize }};
+        {{- if .Values.web.log.persistence.enabled }}
+        access_log {{ .Values.web.log.persistence.mountPath }}/access.log;
+        error_log {{ .Values.web.log.persistence.mountPath }}/error.log warn;
+        {{- else }}
+        access_log /dev/stdout;
+        error_log /dev/stderr warn;
+        {{- end }}
+
+        location = /healthcheck {
+            access_log off;
+            default_type text/plain;
+            return 200 'OK';
+        }
+
+        # Shared by all backend locations, including the /chat SSE stream.
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Connection "";
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout {{ .Values.web.backend.readTimeoutSeconds }}s;
+        proxy_send_timeout {{ .Values.web.backend.readTimeoutSeconds }}s;
+        gzip off;
+
+        {{- $backend := include "cia-agentscope.web.backend" . }}
+        {{- $prefix := .Values.web.backend.pathPrefix }}
+        {{- range concat .Values.web.backend.preservePrefixes .Values.web.backend.directPrefixes | uniq }}
+        {{- if ne . (printf "%s/" $prefix) }}
+        location ^~ {{ . }} {
+            proxy_pass http://{{ $backend }};
+        }
+        {{- end }}
+        {{- end }}
+
+        location = {{ $prefix }} {
+            return 308 {{ $prefix }}/$is_args$args;
+        }
+        location ^~ {{ $prefix }}/ {
+            {{- if .Values.web.backend.stripPrefix }}
+            proxy_pass http://{{ $backend }}/;
+            {{- else }}
+            proxy_pass http://{{ $backend }};
+            {{- end }}
+        }
+
+        location / {
+            try_files $uri $uri/ /index.html;
+        }
+    }
+{{- end }}

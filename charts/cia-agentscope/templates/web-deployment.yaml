@@ -1,0 +1,110 @@
+{{- if .Values.web.enabled }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "cia-agentscope.web.fullname" . }}
+  labels:
+    {{- include "cia-agentscope.web.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.web.replicas }}
+  {{- with .Values.web.updateStrategy }}
+  strategy:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  selector:
+    matchLabels:
+      {{- include "cia-agentscope.web.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "cia-agentscope.web.selectorLabels" . | nindent 8 }}
+      {{- if not .Values.web.nginx.existingConfigMap }}
+      annotations:
+        checksum/nginx: {{ include (print $.Template.BasePath "/web-configmap.yaml") . | sha256sum }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "cia-agentscope.web.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.web.serviceAccount.automountServiceAccountToken }}
+      {{- if .Values.web.priorityClassName }}
+      priorityClassName: {{ .Values.web.priorityClassName | quote }}
+      {{- end }}
+      {{- with .Values.web.imagePullSecrets }}
+      imagePullSecrets:
+        {{- range . }}
+        {{- if kindIs "string" . }}
+        - name: {{ . }}
+        {{- else }}
+        {{- toYaml (list .) | nindent 8 }}
+        {{- end }}
+        {{- end }}
+      {{- end }}
+      {{- with .Values.web.podSecurityContext }}
+      securityContext:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: web
+          image: {{ printf "%s:%s" .Values.web.image.repository .Values.web.image.tag | quote }}
+          imagePullPolicy: {{ .Values.web.image.pullPolicy }}
+          {{- with .Values.web.containerSecurityContext }}
+          securityContext:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+          ports:
+            - name: web-http
+              containerPort: {{ .Values.web.containerPort }}
+              protocol: TCP
+          env:
+            {{- with .Values.web.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+          readinessProbe:
+            httpGet:
+              path: /healthcheck
+              port: web-http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /healthcheck
+              port: web-http
+            initialDelaySeconds: 10
+            periodSeconds: 20
+          resources:
+            {{- toYaml .Values.web.resources | nindent 12 }}
+          volumeMounts:
+            - name: nginx-config
+              mountPath: /etc/nginx/conf.d/default.conf
+              subPath: default.conf
+              readOnly: true
+            {{- if .Values.web.log.persistence.enabled }}
+            - name: web-logs
+              mountPath: {{ .Values.web.log.persistence.mountPath | quote }}
+              subPathExpr: {{ printf "%s$(POD_NAME)" (ternary (printf "%s/" .Values.web.log.persistence.persistentVolumeClaim.subPath) "" (ne .Values.web.log.persistence.persistentVolumeClaim.subPath "")) | quote }}
+            {{- end }}
+      volumes:
+        - name: nginx-config
+          configMap:
+            name: {{ default (include "cia-agentscope.web.fullname" .) .Values.web.nginx.existingConfigMap }}
+        {{- if .Values.web.log.persistence.enabled }}
+        - name: web-logs
+          persistentVolumeClaim:
+            claimName: {{ include "cia-agentscope.web.logClaimName" . }}
+        {{- end }}
+      {{- with .Values.web.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.web.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.web.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+{{- end }}

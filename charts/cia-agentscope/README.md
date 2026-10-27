@@ -1,6 +1,6 @@
 # cia-agentscope Helm Chart
 
-该 Chart 只部署 `cia-agentscope` 应用，不创建 MySQL、Redis 或 OpenSandbox。应用通过 `ClusterIP` 暴露 `7010` 端口，默认单副本，并把所有节点共同挂载的 `/app/dify/sfs` 挂到容器内 `/data/session-files`。
+该 Chart 只部署 `cia-agentscope` 应用，不创建 MySQL、Redis 或 OpenSandbox。应用默认通过 `ClusterIP` 暴露 `7010` 端口（可切换 `NodePort`），默认单副本。存储支持三种模式：`hostPath`（默认，各节点共同挂载的 SFS 目录）、`pvc`（由 chart 创建 PVC，多副本需 `ReadWriteMany`，如 `nfs-client`）、`existingClaim`（复用已有 PVC），均挂载到容器内 `/data/session-files`。
 
 ## 前置条件
 
@@ -25,14 +25,16 @@ docker build -t "$APP_IMAGE" .
 docker push "$APP_IMAGE"
 ```
 
-镜像 tag 应使用不可变版本，不建议生产环境使用 `latest`。把实际 tag 同步写入 `examples/values-prod-hostpath.yaml` 的 `image.tag`。
+镜像 tag 应使用不可变版本，不建议生产环境使用 `latest`。把实际 tag 同步写入 `examples/values-prod-hostpath.yaml` 或 `examples/values-prod-pvc.yaml` 的 `image.tag`。
 
-如果仓库需要认证，提前在目标命名空间创建 `imagePullSecret`，并填入 values 的 `imagePullSecrets`：
+values 默认引用命名空间内预建的 `docker-register-secret` 拉取私仓镜像（与 oia-admin chart 一致）。若目标命名空间中的 Secret 名称不同，请替换：
 
 ```yaml
 imagePullSecrets:
-  - name: registry-credentials
+  - name: docker-register-secret
 ```
+
+本地开发或无需认证的仓库可置空 `imagePullSecrets: []`。
 
 ## 2. 检查每个节点的 SFS
 
@@ -103,12 +105,13 @@ cp examples/values-prod-hostpath.yaml values-prod.yaml
 至少检查：
 
 - `image.tag`：已推送的应用镜像 tag；
-- `imagePullSecrets`：内网仓库需要认证时填写；
+- `imagePullSecrets`：默认 `docker-register-secret`，按命名空间实际 Secret 调整；
 - `externalMysql.host/port/user/database`；
 - `externalRedis.url`；
 - `existingSecret.name`；
-- `storage.hostPath: /app/dify/sfs`；
+- `storage.type`：`hostPath`（默认，需 `storage.hostPath: /app/dify/sfs`）、`pvc`（chart 创建 PVC，见下）或 `existingClaim`；
 - `storage.mountPath: /data/session-files`；
+- `service.type/nodePort`：需要节点端口直接访问时改为 `NodePort` 并可选填固定 `nodePort`；
 - `nodeSelector`：仅部分节点验证通过 SFS 时填写；
 - `resources`：结合压测结果调整。
 
@@ -220,9 +223,26 @@ opensandbox:
 
 如启用了 API Key，同时在已有 Secret 中加入 `OPENSANDBOX_API_KEY`，然后执行 `helm upgrade`。本 Chart 不包含 OpenSandbox CRD、Controller、Server 或 RBAC。
 
-## 10. 切换到已有 PVC
+## 10. 存储模式：PVC 与已有 PVC
 
-未来若集群提供正式的 StorageClass/PVC，可改为：
+集群提供 StorageClass 时，可让 chart 自动创建 PVC（参考 `examples/values-prod-pvc.yaml`）：
+
+```yaml
+storage:
+  type: pvc
+  mountPath: /data/session-files
+  pvc:
+    storageClass: nfs-client
+    accessModes: ReadWriteMany   # 多副本共享必须 ReadWriteMany
+    size: 50Gi
+    # subPath: ""                # 可选，多个 release 共用一个 PVC 时隔离目录
+```
+
+- PVC 名称与 release fullname 一致，默认带 `helm.sh/resource-policy: keep` 注解，`helm uninstall` 不会删除数据卷；
+- `storageClass: "-"` 表示显式禁用动态供给，留空使用集群默认 StorageClass；
+- PVC 模式不会渲染 hostPath。
+
+复用已存在的 PVC 时改为：
 
 ```yaml
 storage:
@@ -230,8 +250,6 @@ storage:
   existingClaim: cia-agentscope-shared-files
   mountPath: /data/session-files
 ```
-
-PVC 模式不会渲染 hostPath。
 
 ## 常见排查
 

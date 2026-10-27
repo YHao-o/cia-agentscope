@@ -45,8 +45,9 @@
       "type": "object",
       "required": ["type", "port", "annotations"],
       "properties": {
-        "type": { "type": "string", "enum": ["ClusterIP"] },
+        "type": { "type": "string", "enum": ["ClusterIP", "NodePort"] },
         "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "nodePort": { "type": "integer", "minimum": 30000, "maximum": 32767 },
         "annotations": { "type": "object" }
       }
     },
@@ -65,10 +66,21 @@
       "type": "object",
       "required": ["type", "hostPath", "mountPath", "existingClaim"],
       "properties": {
-        "type": { "type": "string", "enum": ["hostPath", "existingClaim"] },
+        "type": { "type": "string", "enum": ["hostPath", "pvc", "existingClaim"] },
         "hostPath": { "type": "string" },
         "mountPath": { "type": "string", "minLength": 1 },
-        "existingClaim": { "type": "string" }
+        "existingClaim": { "type": "string" },
+        "pvc": {
+          "type": "object",
+          "required": ["storageClass", "accessModes", "size", "subPath", "annotations"],
+          "properties": {
+            "storageClass": { "type": "string" },
+            "accessModes": { "type": "string", "enum": ["ReadWriteOnce", "ReadOnlyMany", "ReadWriteMany"] },
+            "size": { "type": "string", "minLength": 1 },
+            "subPath": { "type": "string" },
+            "annotations": { "type": "object" }
+          }
+        }
       }
     },
     "externalMysql": {

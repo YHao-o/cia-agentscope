@@ -1,13 +1,17 @@
 replicaCount: 1
 
 image:
-  repository: registry.ccdc.cn:5000/cia-agentscope
-  tag: ""
+  repository: registry.ccdc.cn:5000/cia/cia-agentscope
+  tag: '0.2.0'
   pullPolicy: IfNotPresent
 
-imagePullSecrets: []
-nameOverride: ""
-fullnameOverride: ""
+# 内网仓库 registry.ccdc.cn:5000 需要认证，默认使用命名空间内预建的
+# docker-register-secret（与 oia-admin chart 保持一致）；
+# 本地开发或无需认证的环境请清空该列表。
+imagePullSecrets:
+  - name: docker-register-secret
+nameOverride: ''
+fullnameOverride: ''
 
 containerPort: 7010
 
@@ -15,7 +19,7 @@ serviceAccount:
   create: true
   automount: false
   annotations: {}
-  name: ""
+  name: ''
 
 podAnnotations: {}
 podLabels: {}
@@ -33,7 +37,77 @@ securityContext:
 service:
   type: ClusterIP
   port: 7010
+  # type=NodePort 时可指定固定节点端口（30000-32767），不配置则由集群自动分配
+  # nodePort: 30110
   annotations: {}
+
+# Optional frontend. Enable with examples/values-prod-web.yaml in addition to
+# your existing backend production values. The backend replicaCount is separate.
+web:
+  enabled: false
+  replicas: 2
+  image:
+    repository: registry.ccdc.cn:5000/oia-agentscope-web
+    tag: '1.0.0'
+    pullPolicy: IfNotPresent
+  imagePullSecrets:
+    - name: docker-register-secret
+  # This chart mounts a generated server config that listens on this port.
+  containerPort: 80
+  service:
+    type: NodePort
+    port: 6088
+    nodePort: 30088
+  resources: {}
+  nodeSelector: {}
+  affinity: {}
+  tolerations: []
+  priorityClassName: ''
+  clientMaxBodySize: 100m
+  updateStrategy: {}
+  podSecurityContext: {}
+  containerSecurityContext: {}
+  extraEnv: []
+  serviceAccount:
+    create: false
+    name: ''
+    automountServiceAccountToken: false
+    annotations: {}
+  nginx:
+    root: /usr/share/nginx/html
+    # Optional existing ConfigMap with a server snippet in key default.conf.
+    # Its listen port and health endpoint must match containerPort/healthcheck.
+    existingConfigMap: ''
+  backend:
+    # Empty values select this release's backend Service and service.port.
+    serviceName: ''
+    servicePort: 0
+    # /api/chat -> /chat; native backend /api/auth/ and /api/v1/ stay unchanged.
+    pathPrefix: /api
+    stripPrefix: true
+    preservePrefixes:
+      - /api/auth/
+      - /api/v1/
+      - /api/presentation/
+    # Keep returned file/share URLs on the frontend origin.
+    directPrefixes:
+      - /files/
+      - /persist-files/
+      - /message_share/
+    readTimeoutSeconds: 3600
+  log:
+    persistence:
+      enabled: false
+      mountPath: /var/log/nginx
+      annotations:
+        helm.sh/resource-policy: keep
+      persistentVolumeClaim:
+        existingClaim: ''
+        storageClass: nfs-client
+        accessModes: ReadWriteMany
+        size: 5Gi
+        # Each replica gets its own <subPath>/<Pod name> log directory.
+        subPath: ''
 
 deploymentStrategy:
   type: RollingUpdate
@@ -67,19 +141,32 @@ probes:
     successThreshold: 1
 
 storage:
+  # hostPath：各节点预挂载的本地目录（单副本/同路径节点可用）
+  # pvc：由 chart 创建 PVC 并挂载（多副本需 ReadWriteMany，如 nfs-client）
+  # existingClaim：复用已存在的 PVC
   type: hostPath
   hostPath: /app/dify/sfs
   mountPath: /data/session-files
-  existingClaim: ""
+  existingClaim: ''
+  # storage.type=pvc 时的 PVC 规格（参考 oia-admin chart）
+  pvc:
+    # "-" 表示显式禁用动态供给（storageClassName: ""），留空用集群默认 StorageClass
+    storageClass: nfs-client
+    accessModes: ReadWriteMany
+    size: 50Gi
+    subPath: ''
+    # helm.sh/resource-policy: keep 避免 uninstall 时误删数据卷
+    annotations:
+      helm.sh/resource-policy: keep
 
 externalMysql:
-  host: ""
+  host: ''
   port: 3306
-  user: ""
+  user: ''
   database: agentscope
 
 externalRedis:
-  url: ""
+  url: ''
   sessionTtl: 86400
 
 opensandbox:
@@ -98,7 +185,7 @@ logging:
   dir: /app/logs
 
 existingSecret:
-  name: ""
+  name: ''
   keys:
     mysqlPassword: MYSQL_PASSWORD
     jwtSecret: JWT_SECRET
@@ -110,10 +197,10 @@ existingSecret:
 secret:
   create: false
   stringData:
-    MYSQL_PASSWORD: ""
-    JWT_SECRET: ""
-    CONFIG_ENCRYPTION_KEY: ""
-    OPENSANDBOX_API_KEY: ""
+    MYSQL_PASSWORD: ''
+    JWT_SECRET: ''
+    CONFIG_ENCRYPTION_KEY: ''
+    OPENSANDBOX_API_KEY: ''
 
 resources: {}
 nodeSelector: {}

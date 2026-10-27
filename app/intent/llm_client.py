@@ -15,15 +15,19 @@ from app.services.langfuse_service import get_current_langfuse
 logger = logging.getLogger(__name__)
 
 
-def create_async_client(model_config: dict) -> AsyncOpenAI:
+def create_async_client(model_config: dict, timeout: Optional[float] = None) -> AsyncOpenAI:
     """根据 model_config 段创建 AsyncOpenAI 客户端。
 
     Args:
         model_config: models.xxx 配置段，含 base_url / api_key
+        timeout: 请求超时秒数（None 使用 SDK 默认超时）
     """
     base_url = model_config.get("base_url", "https://api.deepseek.com/v1")
     api_key = model_config.get("api_key", "")
-    return AsyncOpenAI(api_key=api_key, base_url=base_url)
+    kwargs: Dict[str, Any] = {}
+    if timeout is not None:
+        kwargs["timeout"] = timeout
+    return AsyncOpenAI(api_key=api_key, base_url=base_url, **kwargs)
 
 
 async def chat_complete(

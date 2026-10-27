@@ -1,3 +1,4 @@
+import hashlib
 import logging
 from contextlib import contextmanager
 from typing import Any, Iterator, Optional
@@ -5,6 +6,15 @@ from typing import Any, Iterator, Optional
 from app.config import LANGFUSE_PUBLIC_KEY, LANGFUSE_SECRET_KEY, LANGFUSE_HOST
 
 logger = logging.getLogger(__name__)
+
+
+def derive_trace_id(biz_id: str) -> str:
+    """业务 id → langfuse 要求的 32 位小写 hex trace id。
+
+    确定性派生（与制度问答 regulations.providers.langfuse._langfuse_id 同一算法）：
+    同一业务 id 恒得同一 trace_id，反馈 score 无需状态存储即可挂回原 trace。
+    """
+    return hashlib.sha256(biz_id.encode("utf-8")).hexdigest()[:32]
 
 
 class LangfuseService:
@@ -89,13 +99,21 @@ class LangfuseService:
             logger.warning("Langfuse flush failed: %s", e)
 
     @contextmanager
-    def start_span(self, name: str, input: Any = None) -> Iterator[Optional[Any]]:
+    def start_span(self, name: str, input: Any = None, trace_id: Optional[str] = None) -> Iterator[Optional[Any]]:
         """启动一个 span（context manager，自动嵌套到当前活跃 observation 下）。
 
         用 v3 SDK 的 start_as_current_observation，借助 OTel context
         propagation 使子 span 自动成为当前活跃 span 的 child。
         根 span 与子 span 均用此方法；根 span 需保持活跃（with 包裹主体），
         其内启动的子 span 才能正确嵌套。
+
+        trace_id（仅根 span 传，对齐制度问答 kb_search 模式）：
+        显式 TraceContext 使 SDK 打上 AS_ROOT 标记，span 直接映射为
+        trace 记录本体（name/input/output 随 span 属性落库），不依赖
+        服务端对"无父 span → trace"的推断——该推断对版本敏感，裸根
+        span 在部分环境会退化成 unnamed trace（name/input/output 全空）。
+        子 span 不传 trace_id，自动嵌套在当前根观测下（否则会被标
+        AS_ROOT 而误建出独立 trace）。
 
         用法：
             with langfuse_service.start_span("query-rewrite", input={...}) as span:
@@ -108,9 +126,11 @@ class LangfuseService:
             yield None
             return
         try:
-            with self._client.start_as_current_observation(
-                as_type="span", name=name, input=input,
-            ) as obs:
+            kwargs: dict = {"as_type": "span", "name": name, "input": input}
+            if trace_id:
+                from langfuse.types import TraceContext
+                kwargs["trace_context"] = TraceContext(trace_id=trace_id)
+            with self._client.start_as_current_observation(**kwargs) as obs:
                 yield obs
         except Exception as e:
             logger.warning("Langfuse start_span failed: %s", e)

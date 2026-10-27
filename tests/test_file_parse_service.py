@@ -217,18 +217,22 @@ async def test_transcribe_audio_success(monkeypatch):
     monkeypatch.setattr(
         "app.services.chat_service.load_model_config", lambda path=None: cfg
     )
-    resp = _FakeResponse(200, {"text": "测试语音"})
+    resp = _FakeResponse(
+        200, {"choices": [{"message": {"role": "assistant", "content": "测试语音"}}]}
+    )
     client = _FakeClient([resp], [])
     with patch.object(fps.httpx, "AsyncClient", return_value=client):
-        result = await fps.transcribe_audio(b"fake-audio", "t.m4a")
+        result = await fps.transcribe_audio(b"fake-audio", "t.m4a", 7)
     assert result == "测试语音"
     url, kwargs = client.post_calls[0]
-    assert url == "http://asr.example/v1/audio/transcriptions"
+    assert url == "http://asr.example/v1/chat/completions"
     assert kwargs["headers"]["Authorization"] == "Bearer sk-test"
-    assert kwargs["data"]["model"] == "Qwen3-ASR-1.7B"
-    assert kwargs["data"]["prompt"] == "解析音频"
-    assert kwargs["data"]["language"] == "zh"
-    assert kwargs["files"]["file"][0] == "t.m4a"
+    assert kwargs["headers"]["app_serial_number"] == "OIA-AGENTSCOPE-UPLOAD-7"
+    body = kwargs["json"]
+    assert body["model"] == "Qwen3-ASR-1.7B"
+    part = body["messages"][0]["content"][0]
+    assert part["type"] == "audio_url"
+    assert part["audio_url"]["url"].startswith("data:audio/mp4;base64,")
 
 
 @pytest.mark.asyncio

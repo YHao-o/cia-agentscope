@@ -1,0 +1,26 @@
+# Merge after your existing backend production values with a second -f argument.
+# This overlay does not change backend replicas, storage, databases or secrets.
+web:
+  enabled: true
+  replicas: 2
+  image:
+    repository: registry.ccdc.cn:5000/oia-agentscope-web
+    tag: "1.0.0"
+    pullPolicy: IfNotPresent
+  containerPort: 80
+  service:
+    type: NodePort
+    port: 6088
+    nodePort: 30088
+  nodeSelector:
+    group: dify  # Set to {} if the target nodes do not have this label.
+  backend:
+    pathPrefix: /api
+    stripPrefix: true
+  log:
+    persistence:
+      enabled: true  # Set false to use stdout/stderr without a log PVC.
+      persistentVolumeClaim:
+        storageClass: nfs-client
+        accessModes: ReadWriteMany
+        size: 5Gi

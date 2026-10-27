@@ -1,0 +1,24 @@
+{{- if and .Values.web.enabled .Values.web.log.persistence.enabled (not .Values.web.log.persistence.persistentVolumeClaim.existingClaim) }}
+{{- $pvc := .Values.web.log.persistence.persistentVolumeClaim }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "cia-agentscope.web.logClaimName" . }}
+  labels:
+    {{- include "cia-agentscope.web.labels" . | nindent 4 }}
+  {{- with .Values.web.log.persistence.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  accessModes:
+    - {{ $pvc.accessModes | quote }}
+  {{- if eq $pvc.storageClass "-" }}
+  storageClassName: ""
+  {{- else if $pvc.storageClass }}
+  storageClassName: {{ $pvc.storageClass | quote }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ $pvc.size | quote }}
+{{- end }}

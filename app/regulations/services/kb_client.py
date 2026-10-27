@@ -211,6 +211,7 @@ class KBClient:
         page: int = 1,
         page_size: int = 20,
         search: str = "",
+        category_id: str | None = None,
     ) -> dict:
         """调用 POST /api/v1/internal/documents/query（kb_app 文档列表接口）。
 
@@ -230,6 +231,8 @@ class KBClient:
             "page_size": page_size,
             "search": search,
         }
+        if category_id:
+            payload["category_id"] = category_id
         try:
             resp = await self.client.post(
                 "/api/v1/internal/documents/query",

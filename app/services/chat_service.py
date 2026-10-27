@@ -22,14 +22,17 @@ from agentscope.credential import OpenAICredential
 from agentscope.model import OpenAIChatModel
 
 from app.config import MODEL_CONFIG_PATH, SESSION_FILES_PERSIST_DIR
-from app.services.file_change_detector import diff
-from app.services.langfuse_service import LangfuseService
+from app.services.file_change_detector import diff, filter_allowed
+from app.services.langfuse_service import LangfuseService, derive_trace_id
+from app.services.round_state import RoundState
 from app.services.sensitive_service import (
     build_message_replace_event,
     check_sensitive,
     dict_check_sensitive,
 )
 from app.intent.llm_client import chat_complete, extract_json
+from app.utils.event_serialization import sanitize_surrogates
+from tools.bocha_search_tools import merge_bocha_snapshots
 
 logger = logging.getLogger(__name__)
 
@@ -126,13 +129,14 @@ def _extract_user_input(messages: List[Dict[str, Any]]) -> str:
 
 
 def _safe_update_span(span: Any, output_dict: dict) -> None:
-    """安全更新 span 的 output 字段，span 为 None 或更新异常均静默忽略。"""
+    """安全更新 span 的 output 字段，span 为 None 静默忽略，更新异常打告警日志。"""
     if not span:
         return
     try:
         span.update(output=output_dict)
     except Exception:
-        pass
+        # 根 span 的 output 回填失败会让 trace 缺 output，必须留下排查线索
+        logger.warning("[chat_service] 更新 span output 失败", exc_info=True)
 
 
 async def _load_history_messages(session_service: Any, session_id: Optional[str]) -> List[dict]:
@@ -171,8 +175,9 @@ async def _emit_recommended_questions(
 
         root_span_ctx = (
             langfuse_service.start_span(
+                # 信息精简：reply 与根 span 输出重复，不重复上传
                 "recommended-questions",
-                input={"user_input": user_input, "reply": final_output},
+                input={"user_input": user_input},
             )
             if langfuse_service and langfuse_service.enabled
             else _noop_ctx()
@@ -193,7 +198,6 @@ async def _emit_recommended_questions(
 
 
 async def _persist_conversation_history(
-    orchestrator_service,
     session_service: Any,
     session_id: Optional[str],
     user_id: Optional[str],
@@ -204,15 +208,19 @@ async def _persist_conversation_history(
     citations: Optional[List[dict]] = None,
     bocha_sum: Optional[List[dict]] = None,
     content_parts: Optional[List[dict]] = None,
+    round_state: Optional[RoundState] = None,
 ) -> Optional[dict]:
     """持久化本轮对话历史（用户输入 + 智能体输出）。
 
-    从 orchestrator_service 提取本轮参与的 agent_id 列表与成功标志，
-    与 user/assistant 消息一同写入 messages 表。任何异常均静默吞掉。
+    本轮参与的 agent_id 列表、成功标志、真实 token 与消费的上传文件 id
+    均取自 round_state（每请求独立对象，见 round_state.py；替代原先挂在
+    orchestrator 单例上的 last_* 属性——单例会被并发请求互相覆盖，典型
+    症状是上传文件绑定被清零、旧文件下一轮重复注入），与 user/assistant
+    消息一同写入 messages 表。任何异常均静默吞掉。
     message_pair_id 为本轮对话配对 id（user/assistant 共享）；
     citations 为制度问答引用、bocha_sum 为博查搜索来源摘要
     （均随 assistant 消息落库，空则不写）。
-    落库成功后把本轮 user 消息 id 回填到该会话未绑定的上传文件
+    落库成功后把本轮 user 消息 id 回填到本轮消费的上传文件
     （upload_files.message_id），避免下一轮重复注入解析内容。
 
     Returns:
@@ -233,6 +241,13 @@ async def _persist_conversation_history(
     try:
         now_str = datetime.now(_BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         user_input = _extract_user_input(messages)
+        # 落库前清洗孤立代理字符：流式 chunk 切开的 emoji 半字符会导致
+        # pymysql UTF-8 编码失败，整轮对话历史（user+assistant）全部丢失
+        user_input = sanitize_surrogates(user_input)
+        final_output = sanitize_surrogates(final_output)
+        citations = sanitize_surrogates(citations)
+        bocha_sum = sanitize_surrogates(bocha_sum)
+        content_parts = sanitize_surrogates(content_parts)
 
         new_messages = []
         if user_input:
@@ -246,30 +261,17 @@ async def _persist_conversation_history(
             })
         if final_output:
             # 取本轮参与的 agent_id 列表（单 agent 路径=[agent_id]，多 agent 路径=编排汇总）
-            involved_agent_ids = []
-            if orchestrator_service is not None:
-                try:
-                    involved_agent_ids = orchestrator_service.last_agent_ids
-                except Exception:
-                    involved_agent_ids = []
+            involved_agent_ids = (
+                list(round_state.agent_ids) if round_state else []
+            )
             # 取本轮编排是否成功（基于 TaskResult.success，异常/超时/失败为 False）
-            last_success = True
-            if orchestrator_service is not None:
-                try:
-                    last_success = orchestrator_service.last_success
-                except Exception:
-                    last_success = False
+            last_success = round_state.success if round_state else True
             # 真实 token 消耗：MODEL_CALL_END 事件累积的 input+output 之和；
             # 为 0（如自有 LLM 链路未发事件、异常降级）时回退文本估算
-            real_tokens = 0
-            if orchestrator_service is not None:
-                try:
-                    real_tokens = (
-                        int(orchestrator_service.last_input_tokens or 0)
-                        + int(orchestrator_service.last_output_tokens or 0)
-                    )
-                except Exception:
-                    real_tokens = 0
+            real_tokens = (
+                (int(round_state.input_tokens or 0) + int(round_state.output_tokens or 0))
+                if round_state else 0
+            )
             new_messages.append({
                 "role": "assistant", "content": final_output, "timestamp": now_str,
                 "agent_ids": involved_agent_ids,
@@ -295,9 +297,18 @@ async def _persist_conversation_history(
         if isinstance(persist_result, dict)
         else None
     )
-    if user_message_id and upload_file_dao:
+    # 只绑定本轮实际消费过的文件（orchestrator 在 persist 阶段记录到
+    # round_state）：解析中超时与流式期间新上传的文件不绑定，留给下一轮
+    # 消费，避免绑定了却从未注入的"永久孤儿"（用户可见症状：模型说
+    # 工作区没有该文件）
+    consumed_ids = (
+        list(round_state.consumed_upload_ids) if round_state else []
+    )
+    if user_message_id and upload_file_dao and consumed_ids:
         try:
-            bound = await upload_file_dao.bind_message_id(session_id, user_message_id, message_pair_id)
+            bound = await upload_file_dao.bind_message_id(
+                session_id, user_message_id, message_pair_id, consumed_ids
+            )
             if bound:
                 logger.info(
                     "[chat_service] 已绑定 %s 个上传文件到消息 %s",
@@ -351,7 +362,11 @@ async def _detect_and_emit_files(
     try:
         if workspace_manager is not None and session_id:
             after_files = await workspace_manager.list_session_files(user_id, session_id)
-            new_files = diff(before_files, after_files)
+            # 白名单过滤：常规文档/表格/演示/图片及指定代码文件下发前端并落库，
+            # svg/log 等过程文件不进入 files_generated 事件与 session_files
+            new_files = filter_allowed(
+                diff(before_files, after_files, exclude_prefixes=("uploads/",))
+            )
             for rel_path in new_files:
                 size = await workspace_manager.stat_session_file(user_id, session_id, rel_path)
                 if size is None:
@@ -404,7 +419,8 @@ async def _finalize_trace(
     """
     if langfuse_service and langfuse_service.enabled:
         try:
-            langfuse_service.flush()
+            # flush 为同步上传，丢线程池执行避免阻塞事件循环影响并发用户
+            await asyncio.to_thread(langfuse_service.flush)
         except Exception:
             pass
 
@@ -444,6 +460,31 @@ class _PatchedOpenAIChatModel(OpenAIChatModel):
     def _get_structured_output_fallback_exceptions(cls):
         import openai
         return (openai.APIError,)
+
+    def _call_api(self, model_name, messages, tools=None, tool_choice=None, **kwargs):
+        # 请求出口清洗孤立代理：上下文中残留的孤立代理（如流式输出被
+        # chunk 切半的 emoji）若进入请求体，openai 客户端会转义为
+        # \uXXXX 形式发出，Python 3.13 上游 JSON 解析器对孤立代理转义
+        # 报 "Unterminated string" 并返回 400，整轮对话中断。此处
+        # 原地清洗 Msg.content 与文本块，既保住本轮请求也顺带清理内存
+        # 上下文，后续轮次不再复发
+        try:
+            for msg in messages or []:
+                content = getattr(msg, "content", None)
+                if isinstance(content, str):
+                    cleaned = sanitize_surrogates(content)
+                    if cleaned != content:
+                        msg.content = cleaned
+                elif isinstance(content, list):
+                    for block in content:
+                        text = getattr(block, "text", None)
+                        if isinstance(text, str):
+                            cleaned = sanitize_surrogates(text)
+                            if cleaned != text:
+                                block.text = cleaned
+        except Exception:
+            logger.debug("[chat_service] 模型请求前代理清洗跳过", exc_info=True)
+        return super()._call_api(model_name, messages, tools, tool_choice, **kwargs)
 
 
 def create_model_from_config(model_config: dict, message_pair_id: str = ""):
@@ -584,8 +625,8 @@ async def generate_response(
     final_output_parts: List[str] = []
     # 制度问答引用（从编排流 policy_qa_citations 事件累积，随 assistant 消息落库）
     collected_citations: List[dict] = []
-    # 博查搜索来源摘要（bocha_sum 事件为全量快照语义，覆盖取最后一个事件，
-    # 随 assistant 消息落库）
+    # 博查搜索来源统一总表：bocha_sum 事件按 citation_id 幂等合并、升序；
+    # 仅出现新编号时向发送完整快照，落库与 SSE 共用这张总表
     collected_bocha_sum: List[dict] = []
     # 有序内容片段（随 assistant 消息落库 content_parts JSON 列）：
     # text part 来自正文流式 TEXT_BLOCK_DELTA（与组件保持真实穿插顺序），
@@ -610,6 +651,10 @@ async def generate_response(
     before_files: set = set()
     # 本轮对话配对 id：user/assistant 消息与生成/上传文件共享
     message_pair_id = uuid.uuid4().hex
+    # 本轮运行时状态（agent_ids / success / token / 消费的上传文件 id）：
+    # 每请求独立对象，替代 orchestrator 单例上的 last_* 属性，
+    # 并发请求互不覆盖（修复上传文件绑定被竞态清零的问题）
+    round_state = RoundState()
     if session_id:
         try:
             if workspace_manager is not None:
@@ -618,14 +663,28 @@ async def generate_response(
             logger.warning("[chat_service] 快照 session 工作目录失败", exc_info=True)
 
     # ③ 根 span 包裹主体（保持活跃使子 span 自动嵌套）
+    # 信息精简：历史仅留最近 2 条×500 字符（全文在 messages 表落库、
+    # 模型视角上下文在 llm span 留底），当前轮输入保留全文
+    # trace_id 由 message_pair_id 确定性派生（对齐 kb_search 模式）：
+    # 显式 TraceContext 让 SDK 标 AS_ROOT，根 span 直接映射为 trace 记录
+    # 本体（name/input/output 落库），不依赖服务端对裸根 span 的推断
+    lang_trace_id = (
+        derive_trace_id(message_pair_id)
+        if (langfuse_service and langfuse_service.enabled)
+        else None
+    )
     root_span_ctx = (
         langfuse_service.start_span(
             "chat-response",
             input={
-                "messages": full_messages,
+                "messages": [
+                    {"role": m["role"], "content": str(m["content"])[:500]}
+                    for m in history_messages[-2:]
+                ] + messages,
                 "session_id": session_id,
                 "user_id": user_id,
             },
+            trace_id=lang_trace_id,
         )
         if langfuse_service and langfuse_service.enabled
         else _noop_ctx()
@@ -634,15 +693,15 @@ async def generate_response(
     trace_emitted = False
     try:
         with root_span_ctx as root_obs:
-            # P0-3: 流首即下发真实 trace_id（span 内即可读），前端可立即关联反馈
-            trace_id = getattr(root_obs, "trace_id", None) if root_obs else None
-            if trace_id:
+            # P0-3: 流首即下发 trace_id（确定性派生，span 活跃即必然存在），
+            # 前端可立即关联反馈
+            if lang_trace_id and root_obs is not None:
                 trace_emitted = True
-                yield f"data: {json.dumps({'type': 'trace_ready', 'trace_id': trace_id})}\n\n"
+                yield f"data: {json.dumps({'type': 'trace_ready', 'trace_id': lang_trace_id})}\n\n"
                 # 流首保存 trace_id（替代原 finalize 阶段保存，供反馈关联）
                 if session_service and session_id:
                     try:
-                        await session_service.save_latest_trace_id(session_id, trace_id)
+                        await session_service.save_latest_trace_id(session_id, lang_trace_id)
                     except Exception:
                         logger.warning("[chat_service] 流首保存 trace_id 失败", exc_info=True)
             # ③.5 用户输入敏感检测（纯词典，低延迟）。
@@ -677,6 +736,7 @@ async def generate_response(
                 knowledge_bases=knowledge_bases or [],
                 langfuse_service=langfuse_service,
                 message_pair_id=message_pair_id,
+                round_state=round_state,
             ):
                 # 取消检查点：每个事件之间检测一次（LLM chunk 之间会回到本循环）
                 if _cancelled():
@@ -710,6 +770,31 @@ async def generate_response(
                         )
                         + "\n\n"
                     )
+                elif event_type == "bocha_sum":
+                    # 统一出口：bocha_sum 事件不原样透传。按 citation_id 合并到
+                    # 本轮总表（collected_bocha_sum），仅出现新编号时发送完整
+                    # 快照；落库与 SSE 共用这张总表
+                    merged_bocha = merge_bocha_snapshots(
+                        collected_bocha_sum, payload.get("bocha_sum") or []
+                    )
+                    # 来源条目登记后不可变、编号只增不减，
+                    # 长度增长 <=> 出现新 citation_id，故用长度比较做变更门控
+                    if len(merged_bocha) != len(collected_bocha_sum):
+                        collected_bocha_sum = merged_bocha
+                        yield (
+                            "data: "
+                            + json.dumps(
+                                {
+                                    "type": "bocha_sum",
+                                    "bocha_sum": collected_bocha_sum,
+                                },
+                                ensure_ascii=False,
+                            )
+                            + "\n\n"
+                        )
+                    else:
+                        # 较旧/无变化快照：丢弃，避免前端覆盖式渲染回退
+                        collected_bocha_sum = merged_bocha
                 else:
                     yield event_str
 
@@ -741,11 +826,6 @@ async def generate_response(
 
                         if event_type == "policy_qa_citations":
                             collected_citations.extend(payload.get("citations") or [])
-
-                        if event_type == "bocha_sum":
-                            # 事件为"全量快照"语义（每事件携带累积全量列表），
-                            # 覆盖取最后一个事件即可，extend 会造成来源重复
-                            collected_bocha_sum = payload.get("bocha_sum") or []
 
                         # 兜底收集失败终止事件的文本（仅当无 summary 时才启用）
                         if event_type == "pipeline_intercept":
@@ -814,7 +894,7 @@ async def generate_response(
 
             # ⑥ 持久化对话历史（用户输入 + 智能体输出）+ 回填上传文件 message_id
             persist_ids = await _persist_conversation_history(
-                orchestrator_service, session_service, session_id, user_id,
+                session_service, session_id, user_id,
                 messages, final_output,
                 upload_file_dao=getattr(
                     request.app.state, "upload_file_dao", None
@@ -823,6 +903,7 @@ async def generate_response(
                 citations=collected_citations,
                 bocha_sum=collected_bocha_sum,
                 content_parts=collected_content_parts,
+                round_state=round_state,
             )
 
             # ⑦ 检测本轮新文件
@@ -853,19 +934,27 @@ async def generate_response(
             aborted_at_ms = int((time.perf_counter() - t0) * 1000)
         logger.info(f"[chat_service] 会话被用户中断 session={session_id}")
     finally:
-        # 中断时也落库：success 强制 False（绕开单例 last_success 污染）
+        # 中断时也落库：success 强制 False（round_state 为每请求独立对象，
+        # 但中断轮答案被截断，语义上应为失败，仍补 UPDATE 强制标记）
         if aborted:
             if not final_output:
                 final_output = "\n".join(p for p in final_fallback_parts if p).strip()
             await _persist_conversation_history(
-                orchestrator_service, session_service, session_id, user_id,
+                session_service, session_id, user_id,
                 messages, final_output,
+                # 中断轮同样回填上传文件 message_id：本轮已注入消费的文件
+                # 若不绑定，下一轮会与新上传文件一起重复注入
+                # （用户可见症状：后一次提问用的是前一个文件）
+                upload_file_dao=getattr(
+                    request.app.state, "upload_file_dao", None
+                ) if request is not None else None,
                 message_pair_id=message_pair_id,
                 citations=collected_citations,
                 bocha_sum=collected_bocha_sum,
                 content_parts=collected_content_parts,
+                round_state=round_state,
             )
-            # _persist 内部读 orchestrator_service.last_success（单例，不可信），补 UPDATE 强制失败
+            # 中断轮答案被截断，语义上应为失败：补 UPDATE 强制标记
             if session_service and session_id and user_id:
                 try:
                     await session_service.mark_last_assistant_failed(session_id, user_id)

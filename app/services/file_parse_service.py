@@ -2,7 +2,7 @@
 
 上传接口收到文件后立即返回，由本服务在后台完成解析并写入 upload_files 表：
 - 图片/文档/pdf/表格 → MinerU（提交 + 轮询，逻辑迁移自原 tools/mineru_tools.py）
-- 音频 → OpenAI 兼容 /v1/audio/transcriptions（默认 Qwen3-ASR-1.7B）
+- 音频 → OpenAI 兼容 /v1/chat/completions（音频 base64 data URI 传入，默认 Qwen3-ASR-1.7B）
 - 纯文本 → 直接解码
 - 其余 → 只入库不解析（不注入提示词）
 
@@ -10,7 +10,9 @@
 问答注入时 agent 能诚实告知用户该文件解析失败。
 """
 import asyncio
+import base64
 import logging
+import uuid
 from pathlib import Path
 
 import httpx
@@ -22,11 +24,23 @@ logger = logging.getLogger(__name__)
 # 音频扩展名（media_type 可能缺失或不规范，扩展名兜底）
 _AUDIO_EXTENSIONS = {".m4a", ".mp3", ".wav", ".webm", ".aac", ".ogg", ".flac", ".wma"}
 
+# 扩展名 → data URI 的 mime（chat 接口按 base64 data URI 传音频）
+_AUDIO_MIME_BY_EXT = {
+    ".mp3": "audio/mpeg",
+    ".wav": "audio/wav",
+    ".m4a": "audio/mp4",
+    ".webm": "audio/webm",
+    ".aac": "audio/aac",
+    ".ogg": "audio/ogg",
+    ".flac": "audio/flac",
+    ".wma": "audio/x-ms-wma",
+}
+
 # MinerU 支持的文档/图片扩展名（与原 tools/mineru_tools.SUPPORTED_EXTENSIONS 一致）
 _MINERU_EXTENSIONS = {
     ".pdf", ".doc", ".docx",
-    ".xls", ".xlsx", ".csv",
-    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp",
+    ".xls", ".xlsx",
+    ".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".pptx",
 }
 
 _MINERU_POLL_INTERVAL = 2  # 秒
@@ -48,7 +62,7 @@ def classify_parse_type(media_type: str, filename: str) -> str:
         return "asr"
     if (media_type or "").startswith("image/"):
         return "mineru"
-    if (media_type or "") == "text/plain" or ext in {".txt", ".md"}:
+    if (media_type or "") in {"text/plain", "text/csv"} or ext in {".txt", ".md", ".csv"}:
         return "plain_text"
     if ext in _MINERU_EXTENSIONS:
         return "mineru"
@@ -56,7 +70,6 @@ def classify_parse_type(media_type: str, filename: str) -> str:
     doc_media_types = {
         "application/pdf",
         "application/msword",
-        "text/csv",
         "application/vnd.ms-excel",
         "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
         "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
@@ -88,7 +101,16 @@ async def parse_document_with_mineru(content: bytes, filename: str) -> str:
                 data={"output_formats": "md"},
             )
             if resp.status_code != 201:
-                return f"解析失败，MinerU服务暂时无法解析该文件（HTTP {resp.status_code}）"
+                logger.warning(
+                    "[upload-parse] MinerU 提交失败 HTTP %s body=%s (%s)",
+                    resp.status_code, resp.text[:500], filename,
+                )
+                try:
+                    detail = (resp.json() or {}).get("detail", "")
+                except Exception:
+                    detail = ""
+                suffix = f"：{detail}" if detail else ""
+                return f"解析失败，MinerU服务暂时无法解析该文件（HTTP {resp.status_code}{suffix}）"
             task_id = resp.json().get("id")
             if not task_id:
                 return "解析失败，MinerU服务暂时无法解析该文件（提交响应缺少 task id）"
@@ -117,12 +139,20 @@ async def parse_document_with_mineru(content: bytes, filename: str) -> str:
                         if elapsed >= UPLOAD_PARSE_TIMEOUT:
                             return _MINERU_TIMEOUT_MSG
                 if r.status_code != 200:
+                    logger.warning(
+                        "[upload-parse] MinerU 查询失败 HTTP %s body=%s task=%s",
+                        r.status_code, r.text[:500], task_id,
+                    )
                     return f"解析失败，MinerU服务暂时无法解析该文件（HTTP {r.status_code}）"
                 data = r.json()
                 status = data.get("status")
                 if status == "completed":
                     md = (data.get("result") or {}).get("md_content")
                     if not md:
+                        logger.warning(
+                            "[upload-parse] MinerU 解析完成但内容为空 data=%s task=%s",
+                            str(data)[:500], task_id,
+                        )
                         return "解析失败，MinerU 解析完成但内容为空"
                     return md
                 if status == "failed":
@@ -138,11 +168,15 @@ async def parse_document_with_mineru(content: bytes, filename: str) -> str:
         return f"解析失败，MinerU服务暂时无法解析该文件（{e}）"
 
 
-async def transcribe_audio(content: bytes, filename: str) -> str:
-    """调音频转写模型（OpenAI 兼容 /v1/audio/transcriptions），返回转写文本。
+async def transcribe_audio(content: bytes, filename: str, file_id: int | None = None) -> str:
+    """调音频转写模型（OpenAI 兼容 /v1/chat/completions），返回转写文本。
 
-    模型配置来自 model_config.yml 的 models.audio_transcriber
-    （默认 Qwen3-ASR-1.7B）。失败/超时返回提示文案。
+    接口与其他文本模型一致（chat completions 形态）：音频以 base64
+    data URI 放在 messages[0].content 的 audio_url 分片。模型配置来自
+    model_config.yml 的 models.audio_transcriber（默认 Qwen3-ASR-1.7B）。
+    请求头带全局流水号 app_serial_number = OIA-AGENTSCOPE-UPLOAD-{file_id}
+    （与业务对话 LLM 的 OIA-AGENTSCOPE-{message_pair_id} 同一绑定方式）。
+    失败/超时返回提示文案。
     """
     # 延迟导入避免模块级连锁依赖
     from app.services.chat_service import load_model_config
@@ -162,21 +196,49 @@ async def transcribe_audio(content: bytes, filename: str) -> str:
         return "解析失败，音频解析模型未配置（model_config.yml 缺少 audio_transcriber.base_url）"
 
     timeout = int(params.get("timeout") or UPLOAD_PARSE_TIMEOUT)
+    # 接口与其他文本模型同一约定：base_url 含 /v1；漏写时自动补齐，
+    # 避免拼出 .../v1/v1/... 双 /v1 导致 404
+    if not base_url.endswith("/v1"):
+        base_url = f"{base_url}/v1"
+    url = f"{base_url}/chat/completions"
+    ext = Path(filename).suffix.lower()
+    mime = _AUDIO_MIME_BY_EXT.get(ext, "audio/mpeg")
+    audio_uri = "data:" + mime + ";base64," + base64.b64encode(content).decode("ascii")
+    payload = {
+        "model": model_name,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "audio_url", "audio_url": {"url": audio_uri}},
+                ],
+            }
+        ],
+    }
     try:
+        # 全局流水号：与业务对话 LLM 调用同一绑定方式（请求头注入）；
+        # 上传解析无 message_pair_id，用 file_id 关联 upload_files 行，
+        # 缺省回退 uuid
+        pair = file_id if file_id is not None else uuid.uuid4().hex
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "app_serial_number": f"OIA-AGENTSCOPE-UPLOAD-{pair}",
+        }
         async with httpx.AsyncClient(timeout=float(timeout)) as client:
             resp = await client.post(
-                f"{base_url}/v1/audio/transcriptions",
-                headers={"Authorization": f"Bearer {api_key}"},
-                data={
-                    "model": model_name,
-                    "prompt": params.get("prompt", "解析音频"),
-                    "language": params.get("language", "zh"),
-                },
-                files={"file": (filename, content)},
+                url,
+                headers=headers,
+                json=payload,
             )
         if resp.status_code != 200:
+            logger.warning(
+                "[upload-parse] ASR HTTP %s url=%s body=%s",
+                resp.status_code, url, resp.text[:500],
+            )
             return f"解析失败，音频解析服务暂时无法解析该文件（HTTP {resp.status_code}）"
-        text = (resp.json() or {}).get("text") or ""
+        choices = (resp.json() or {}).get("choices") or []
+        message = (choices[0].get("message") or {}) if choices else {}
+        text = message.get("content") or ""
         if not text:
             return "解析失败，音频解析服务返回空转写结果"
         return text
@@ -189,9 +251,13 @@ async def transcribe_audio(content: bytes, filename: str) -> str:
 
 async def _parse_and_store(dao, file_id: int, content: bytes, filename: str, parse_type: str) -> None:
     """后台解析并写库（含 Langfuse 埋点）。任何异常都收敛为入库的失败文案。"""
-    from app.services.langfuse_service import get_current_langfuse
+    from app.services.langfuse_service import derive_trace_id, get_current_langfuse
 
     langfuse_service = get_current_langfuse()
+    # 后台任务运行在请求上下文之外，upload-parse 是裸根 span：
+    # 传确定性 trace_id（从 file_id 派生）让 SDK 标 AS_ROOT，span 直接
+    # 映射为 trace 记录本体，不依赖服务端对裸根 span 的推断（对齐
+    # kb_search 模式，避免部分环境退化成 unnamed trace）
     span_ctx = (
         langfuse_service.start_span(
             "upload-parse",
@@ -200,6 +266,7 @@ async def _parse_and_store(dao, file_id: int, content: bytes, filename: str, par
                 "parse_type": parse_type,
                 "size": len(content),
             },
+            trace_id=derive_trace_id(f"upload-{file_id}"),
         )
         if langfuse_service and getattr(langfuse_service, "enabled", False)
         else None
@@ -214,7 +281,7 @@ async def _parse_and_store(dao, file_id: int, content: bytes, filename: str, par
         if parse_type == "mineru":
             parsed = await parse_document_with_mineru(content, filename)
         elif parse_type == "asr":
-            parsed = await transcribe_audio(content, filename)
+            parsed = await transcribe_audio(content, filename, file_id)
         elif parse_type == "plain_text":
             parsed = content.decode("utf-8", errors="replace")
         else:

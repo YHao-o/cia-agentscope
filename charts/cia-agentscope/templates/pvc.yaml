@@ -1,0 +1,24 @@
+{{- if eq .Values.storage.type "pvc" }}
+{{- $pvc := .Values.storage.pvc }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "cia-agentscope.fullname" . }}
+  labels:
+    {{- include "cia-agentscope.labels" . | nindent 4 }}
+  {{- with $pvc.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+spec:
+  accessModes:
+    - {{ required "storage.pvc.accessModes is required for pvc storage" $pvc.accessModes | quote }}
+  {{- if eq $pvc.storageClass "-" }}
+  storageClassName: ""
+  {{- else if $pvc.storageClass }}
+  storageClassName: {{ $pvc.storageClass }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ required "storage.pvc.size is required for pvc storage" $pvc.size }}
+{{- end }}

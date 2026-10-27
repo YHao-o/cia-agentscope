@@ -1,6 +1,6 @@
 apiVersion: v2
 name: cia-agentscope
-description: Helm chart for deploying the cia-agentscope application
+description: Helm chart for the cia-agentscope backend and optional Nginx frontend
 type: application
-version: 0.1.0
+version: 0.2.0
 appVersion: "0.1.0"

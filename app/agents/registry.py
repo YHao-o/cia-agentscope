@@ -45,6 +45,7 @@ class AgentRegistry:
         all_skills_meta: list,
         create_model_fn,
         extra_skill_names: Optional[List[str]] = None,
+        agent_bound_tools: Optional[dict] = None,
     ):
         """
         Args:
@@ -56,6 +57,8 @@ class AgentRegistry:
                              每次调用返回新的模型实例（流式模型不可复用）
             extra_skill_names: 请求级附加技能名，union 到每个 agent 的绑定技能
                                （无论该 agent 是否绑定该技能，都会组装进其 Toolkit）
+            agent_bound_tools: 工具智能体绑定（工具名 → 智能体 id 列表），
+                               声明的工具只注入给列表内智能体，其余智能体不可见
         """
         self._defs: Dict[str, AgentDefinition] = {d.id: d for d in definitions}
         self._workspace = workspace
@@ -64,6 +67,10 @@ class AgentRegistry:
         self._create_model_fn = create_model_fn
         # 请求级附加技能：组装 Toolkit 时与 agent 自身绑定技能取并集
         self._extra_skill_names = set(extra_skill_names or [])
+        # 工具智能体绑定：声明的工具仅注入给指定智能体
+        self._agent_bound_tools: dict = {
+            str(k): list(v or []) for k, v in (agent_bound_tools or {}).items()
+        }
         # 缓存每个智能体对应的 Toolkit（按 skill 子集组装），避免重复筛选
         self._toolkits: Dict[str, Toolkit] = {}
 
@@ -148,11 +155,29 @@ class AgentRegistry:
             )
             return []
 
+    def _filter_tools_for_agent(self, definition: AgentDefinition, tools: list) -> list:
+        """工具绑定过滤：agent_bound_tools 声明的工具仅注入给列表内智能体。
+
+        未声明的工具保持全局可见（行为与无配置时一致）。
+        """
+        if not self._agent_bound_tools:
+            return tools
+        result = []
+        for t in tools:
+            name = getattr(t, "name", None)
+            if name in self._agent_bound_tools:
+                allowed = self._agent_bound_tools.get(name) or []
+                if definition.id not in allowed:
+                    continue
+            result.append(t)
+        return result
+
     def _build_toolkit_for(self, definition: AgentDefinition) -> Toolkit:
         """根据智能体绑定的 skill 列表，筛选工具子集组装 Toolkit。
 
         有效绑定技能 = agent 自身绑定技能 ∪ 请求级附加技能（extra_skill_names）。
         无任何绑定技能时返回空 Toolkit，即纯对话无工具。
+        工具侧：agent_bound_tools 声明的绑定工具仅注入给列表内智能体。
         """
         # MCP 客户端（agent_access 项 mcpClientConfig → stateless HTTP MCP）
         mcps = self._build_mcp_clients(definition)
@@ -161,6 +186,9 @@ class AgentRegistry:
         bound_skill_names = set(definition.skills) | self._extra_skill_names
         if not bound_skill_names:
             return Toolkit(tools=[], skills_or_loaders=[], mcps=mcps)
+
+        # 工具绑定过滤：非绑定智能体拿不到声明的工具
+        tools = self._filter_tools_for_agent(definition, self._all_tools)
 
         # 从 skill 元信息中筛选出绑定的 skill loader
         bound_loaders = []
@@ -182,7 +210,7 @@ class AgentRegistry:
             )
 
         return Toolkit(
-            tools=self._all_tools, skills_or_loaders=bound_loaders, mcps=mcps
+            tools=tools, skills_or_loaders=bound_loaders, mcps=mcps
         )
 
     def get_toolkit(self, agent_id: str) -> Optional[Toolkit]:
@@ -232,7 +260,7 @@ class AgentRegistry:
             system_prompt=definition.system_prompt
             + f"\n当前时间：{_get_current_date_str()}。涉及\"今天/本周/最近\"等时间表述时以此为准。"
             + f"\n注意当前工作区目录是/data/workspaces/{session_id}，你只能在该目录下创建/编辑文件，绝不允许修改目录以外的文件！"
-            + "\n用户上传的文件不会出现在工作区目录中：其内容已解析并直接附在用户问题里，请直接阅读使用，不要尝试在工作区中查找用户附件。"
+            + "\n用户本轮上传的文件内容会直接附在用户问题里，请直接阅读使用。此外，本会话此前轮次上传文件的解析副本存放在工作目录 uploads/ 下（文件名为 <原文件名>.md）：当用户点名或指代历史文件时，可读取 uploads/ 下对应文件获取内容。"
             + "\n当你生成文件时，生成的文件内容只要用户不做特殊说明应该以中文为主。"
             + "\n当用户要求修改文件时，必须生成新文件名（如添加版本号、时间戳或_modified后缀），严禁直接覆盖原文件，以防止数据丢失。"
             + "\n你仅允许通过系统内置的技能/工具获取外部信息（如联网搜索、知识库查询等），禁止自行使用curl、wget、requests或其他方式直接访问外部接口；禁止下载、安装额外的依赖包。若现有信息不足以解答用户问题，请如实告知、或尝试挖掘已有线索进行处理。"

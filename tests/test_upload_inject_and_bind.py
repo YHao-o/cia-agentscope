@@ -12,6 +12,7 @@ from app.services.upload_context_provider import (
     wait_for_upload_parsing,
 )
 from app.services.chat_service import _persist_conversation_history
+from app.services.round_state import RoundState
 from app.dao.upload_file_dao import UploadFileDAO
 
 
@@ -36,8 +37,8 @@ class _FakeUploadDao:
     async def load_unbound_parsing(self, session_id):
         return self.parsing_rows
 
-    async def bind_message_id(self, session_id, message_id, message_pair_id=None):
-        self.bind_calls.append((session_id, message_id, message_pair_id))
+    async def bind_message_id(self, session_id, message_id, message_pair_id=None, file_ids=None):
+        self.bind_calls.append((session_id, message_id, message_pair_id, list(file_ids or [])))
         return len(self.bind_calls)
 
 
@@ -399,12 +400,28 @@ async def test_persist_binds_user_message_id():
     dao = _FakeUploadDao()
     session_service = _make_session_service(user_message_id=101)
     await _persist_conversation_history(
-        None, session_service, "s1", "u1", _MESSAGES, "回答内容",
+        session_service, "s1", "u1", _MESSAGES, "回答内容",
         upload_file_dao=dao,
         message_pair_id="pair-1",
+        round_state=RoundState(consumed_upload_ids=[5]),
     )
-    # bind_message_id 三参调用：session_id + user_message_id + message_pair_id
-    assert dao.bind_calls == [("s1", 101, "pair-1")]
+    # bind_message_id 四参调用：session_id + user_message_id + message_pair_id + file_ids
+    assert dao.bind_calls == [("s1", 101, "pair-1", [5])]
+
+
+@pytest.mark.asyncio
+async def test_persist_skips_bind_when_no_consumed_files():
+    """本轮没有实际消费的上传文件（如解析超时未注入、流式期间新上传）
+    时不绑定，留给下一轮消费——防止"绑定了却从未注入"的永久孤儿。"""
+    dao = _FakeUploadDao()
+    session_service = _make_session_service(user_message_id=101)
+    await _persist_conversation_history(
+        session_service, "s1", "u1", _MESSAGES, "回答内容",
+        upload_file_dao=dao,
+        message_pair_id="pair-1",
+        round_state=RoundState(consumed_upload_ids=[]),
+    )
+    assert dao.bind_calls == []
 
 
 @pytest.mark.asyncio
@@ -412,8 +429,9 @@ async def test_persist_skips_bind_when_no_user_message_id():
     dao = _FakeUploadDao()
     session_service = _make_session_service(user_message_id=None)
     await _persist_conversation_history(
-        None, session_service, "s1", "u1", _MESSAGES, "回答内容",
+        session_service, "s1", "u1", _MESSAGES, "回答内容",
         upload_file_dao=dao,
+        round_state=RoundState(consumed_upload_ids=[5]),
     )
     assert dao.bind_calls == []
 
@@ -423,7 +441,7 @@ async def test_persist_skips_bind_when_dao_missing():
     session_service = _make_session_service(user_message_id=101)
     # upload_file_dao 为 None：不回填、不报错
     await _persist_conversation_history(
-        None, session_service, "s1", "u1", _MESSAGES, "回答内容",
+        session_service, "s1", "u1", _MESSAGES, "回答内容",
         upload_file_dao=None,
     )
 
@@ -435,11 +453,12 @@ async def test_persist_swallows_bind_exception():
     session_service = _make_session_service(user_message_id=101)
     # bind 抛异常不影响主流程（不向外抛）
     await _persist_conversation_history(
-        None, session_service, "s1", "u1", _MESSAGES, "回答内容",
+        session_service, "s1", "u1", _MESSAGES, "回答内容",
         upload_file_dao=dao,
+        round_state=RoundState(consumed_upload_ids=[1]),
     )
     # 未传 message_pair_id 时第三参为 None
-    dao.bind_message_id.assert_awaited_once_with("s1", 101, None)
+    dao.bind_message_id.assert_awaited_once_with("s1", 101, None, [1])
 
 
 # ---------------------------------------------------------------------------

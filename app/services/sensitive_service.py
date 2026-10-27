@@ -156,7 +156,7 @@ async def _run_check(
                                 "reason": result["reason"],
                                 "hit_sources": result["hit_sources"],
                                 "sensitive_words": result["sensitive_words"],
-                                "raw": result["raw"],
+                                # 信息精简：raw 原始报文冗余，解析字段已覆盖分析需求
                             },
                             metadata={
                                 "latency_ms": int((time.perf_counter() - t0) * 1000),

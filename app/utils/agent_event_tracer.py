@@ -90,21 +90,9 @@ class AgentEventTracer:
                 self._collected_citations.extend(meta_citations)
             meta_bocha = meta.get("bocha_sum")
             if isinstance(meta_bocha, list) and meta_bocha:
-                # 按 URL 去重（保序）：多轮搜索召回相同页面时仅保留首个，
-                # 避免全量快照中同来源重复展示
-                seen_urls = {
-                    item.get("url")
-                    for item in self._collected_bocha_sum
-                    if isinstance(item, dict)
-                }
-                for item in meta_bocha:
-                    if not isinstance(item, dict):
-                        continue
-                    url = item.get("url")
-                    if url and url in seen_urls:
-                        continue
-                    seen_urls.add(url)
-                    self._collected_bocha_sum.append(item)
+                # 原样收集（不去重）：URL 去重与编号由工具的请求级来源表
+                # 统一负责，快照条目携带 citation_id，由下游按编号幂等合并
+                self._collected_bocha_sum.extend(meta_bocha)
         except Exception:
             logger.debug("[AgentEventTracer] 提取 citations 失败", exc_info=True)
 
@@ -238,16 +226,6 @@ class AgentEventTracer:
             args_buf = self._tool_args_buf.get(event.tool_call_id)
             if args_buf is not None and sum(map(len, args_buf)) < 2000:
                 args_buf.append(event.delta or "")
-            if "\"skill\":" in event.delta:
-                prefix = '"skill":'
-                skill_name = event.delta.replace(prefix, "").replace("\"","")
-                skobs = self._lf.start_observation(
-                    name=f"skill-{skill_name}", as_type="tool",
-                    metadata={"agentId": self._agent_id, "toolCallId": event.tool_call_id},
-                )
-                self._lf.end_observation(
-                    skobs, output=None
-                )
         elif isinstance(event, ToolResultTextDeltaEvent):
             # 累积工具返回文本增量（End 前流式到达，End 时拼装进 output）
             res_buf = self._tool_result_buf.get(event.tool_call_id)

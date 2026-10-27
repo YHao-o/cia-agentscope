@@ -8,10 +8,12 @@ from typing import Any, Optional
 
 from agentscope.state import AgentState
 
+from app.utils.event_serialization import sanitize_surrogates
+
 logger = logging.getLogger(__name__)
 
-# 历史上下文保留条数（3 轮 = 6 条 user/assistant 消息），用于截断 AgentState.context
-_HISTORY_KEEP_LAST = 6
+# 历史上下文保留条数（6 轮 = 12 条 user/assistant 消息），用于截断 AgentState.context
+_HISTORY_KEEP_LAST = 12
 
 
 def migrate_legacy_enum_values(state_dict: dict) -> dict:
@@ -96,6 +98,9 @@ async def persist_agent_state(
     """保存单个 agent 的 AgentState（带非空校验与异常兜底）。"""
     if not (session_service and session_id and user_id and state_dict):
         return
+    # 清洗孤立代理字符：state.context 含模型原始输出，流式 chunk 切开的
+    # emoji 半字符会导致 DAO 层（MySQL/Redis）UTF-8 编码失败、state 丢失
+    state_dict = sanitize_surrogates(state_dict)
     try:
         await session_service.save_agent_state(
             session_id, user_id, agent_id, state_dict,

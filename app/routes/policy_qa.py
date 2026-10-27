@@ -102,6 +102,7 @@ class DocumentQueryRequest(BaseModel):
     search: str = ""
     # 与 /chat 知识库选择器联动：空 = 全选（权限内全部知识库）
     knowledge_bases: List[str] = []
+    category_id: str | None = None
 
 
 async def _load_user_permissions(request: Request, user: dict) -> dict:
@@ -160,6 +161,7 @@ async def policy_documents_query(
             page=body.page,
             page_size=body.page_size,
             search=body.search,
+            category_id=body.category_id,
         )
     except KBClientError as e:
         logger.error(f"[policy-qa] 文档列表查询失败 user={user.get('user_id')}: {e}")
@@ -180,9 +182,10 @@ async def _verify_doc_in_scope(kb_client, kb_ids: list[str], doc_id: str) -> boo
         data = await kb_client.query_documents(
             kb_ids, page=page, page_size=page_size,
         )
-        items = data.get("items") or []
-        if any(item.get("doc_id") == doc_id for item in items):
-            return True
+        for kb in data.get("items") or []:
+            for cat in kb.get("categories") or []:
+                if any(doc.get("doc_id") == doc_id for doc in cat.get("items") or []):
+                    return True
         total = data.get("total") or 0
         if page * page_size >= total:
             return False

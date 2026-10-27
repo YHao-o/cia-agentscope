@@ -1,0 +1,82 @@
+# PVC + NodePort 部署形态（参考 oia-admin chart 的团队标准）：
+# - 存储改为动态创建的 NFS PVC（ReadWriteMany，多副本可共享 /data/session-files）
+# - Service 以固定 NodePort 对外暴露
+replicaCount: 1
+
+image:
+  repository: registry.ccdc.cn:5000/cia/cia-agentscope
+  tag: '0.2.0' # Replace with the immutable tag pushed to the internal registry.
+  pullPolicy: IfNotPresent
+
+imagePullSecrets:
+  - name: docker-register-secret
+
+service:
+  type: NodePort
+  port: 7010
+  nodePort: 30110
+
+storage:
+  type: pvc
+  mountPath: /data/session-files
+  pvc:
+    storageClass: nfs-client
+    accessModes: ReadWriteMany
+    size: 50Gi
+
+externalMysql:
+  host: mysql.database.svc.cluster.local
+  port: 3306
+  user: agentscope
+  database: agentscope
+
+externalRedis:
+  url: redis://redis.cache.svc.cluster.local:6379/0
+  sessionTtl: 86400
+
+existingSecret:
+  name: cia-agentscope-secrets
+
+secret:
+  create: false
+
+opensandbox:
+  domain: localhost:9080
+  poolSize: 0
+
+resources:
+  requests:
+    cpu: 500m
+    memory: 1Gi
+  limits:
+    cpu: '2'
+    memory: 4Gi
+
+nodeSelector: {}
+
+# 前端 Web（Nginx）与后端一同部署（取值合并自 web_charts 生产默认值）。
+# nginx 的 /api 反向代理、前缀剥离与 SSE 代理等设置由 values.yaml 的 web 默认段提供。
+web:
+  enabled: true
+  replicas: 2
+  image:
+    repository: registry.ccdc.cn:5000/oia-agentscope-web
+    tag: '1.0.0'
+    pullPolicy: IfNotPresent
+  imagePullSecrets:
+    - name: docker-register-secret
+  service:
+    type: NodePort
+    port: 6088
+    nodePort: 30088
+  # 前端调度到带 group=dify 标签的节点；目标节点没有该标签时请改为 {}
+  nodeSelector:
+    group: dify
+  # Nginx 日志持久化，与后端存储共用 nfs-client StorageClass
+  log:
+    persistence:
+      enabled: true
+      persistentVolumeClaim:
+        storageClass: nfs-client
+        accessModes: ReadWriteMany
+        size: 5Gi

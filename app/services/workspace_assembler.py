@@ -32,6 +32,7 @@ async def assemble_workspace_components(
     skills: Optional[List[str]] = None,
     knowledge_bases: Optional[List[str]] = None,
     langfuse_service: Optional[Any] = None,
+    agent_bound_tools: Optional[dict] = None,
 ) -> tuple:
     """获取/创建工作区并组装注册表与工厂（依赖沙箱，可与意图链路并行）。
 
@@ -171,6 +172,7 @@ async def assemble_workspace_components(
         all_skills_meta=all_skills_meta,
         create_model_fn=create_model_fn,
         extra_skill_names=extra_skills,
+        agent_bound_tools=agent_bound_tools,
     )
     agent_factory = AgentFactory(registry)
     return registry, agent_factory

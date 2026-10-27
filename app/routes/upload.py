@@ -1,3 +1,4 @@
+import logging
 import uuid
 from typing import Optional
 
@@ -7,9 +8,11 @@ from app.dependencies import current_user
 from app.services.file_service import FileService
 from app.config import UPLOAD_MAX_SIZE_MB, UPLOAD_ALLOWED_MEDIA_TYPES
 from app.models.upload import UploadResponse, UploadErrorResponse
-from app.services.file_parse_service import start_background_parse
+from app.services.file_parse_service import classify_parse_type, start_background_parse
 
 router = APIRouter()
+
+logger = logging.getLogger(__name__)
 
 
 @router.post("/upload", response_model=UploadResponse)
@@ -39,6 +42,18 @@ async def upload_file(
     # Validate media type
     media_type = file.content_type or "application/octet-stream"
     if not FileService.validate_media_type(media_type, UPLOAD_ALLOWED_MEDIA_TYPES):
+        raise HTTPException(
+            status_code=415,
+            detail=UploadErrorResponse(
+                code=415,
+                msg="不支持的文件类型",
+            ).model_dump(),
+        )
+    if classify_parse_type(media_type, file.filename or "unknown") == "none":
+        logger.warning(
+            "[upload] 拒绝不可解析文件 media_type=%s filename=%s",
+            media_type, file.filename,
+        )
         raise HTTPException(
             status_code=415,
             detail=UploadErrorResponse(

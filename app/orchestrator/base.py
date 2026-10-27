@@ -109,9 +109,11 @@ class BaseOrchestrator(ABC):
                 f"agent-{agent_id}",
                 input={
                     "intent": intent.id,
-                    "query": intent.query,
-                    "system_prompt": agent_sys_prompt,
-                    "user_message": user_content,
+                    # 信息精简：query 注入的文件全文在 upload_files.parsed_content 留底，
+                    # system_prompt 全文以仓库/配置为准（llm span 另有前 1000 字符副本）
+                    "query": intent.query[:2000],
+                    "system_prompt": agent_sys_prompt[:1000],
+                    "user_message": user_content[:2000],
                 },
             )
             if langfuse_service
@@ -120,10 +122,12 @@ class BaseOrchestrator(ABC):
         with span_ctx as agent_span:
             from app.utils.agent_event_tracer import AgentEventTracer
             from app.utils.agent_event_stream import iter_agent_events
+            from app.utils.event_serialization import serialize_agent_event
             from agentscope.event import ToolResultEndEvent as _ToolResultEnd
+            from tools.bocha_search_tools import merge_bocha_snapshots
             tracer = AgentEventTracer(langfuse_service, agent_id, agent=agent)
-            # 已下发 bocha_sum 累积：每次事件发"全量快照"而非增量，
-            # 多次搜索时前端覆盖式渲染仍得到完整来源列表（与流末单事件语义兼容）
+            # 已下发 bocha_sum 累积：按 citation_id 幂等合并、升序，
+            # 每次事件发"全量快照"而非增量，多次搜索时前端覆盖式渲染仍得到完整来源列表
             bocha_emitted: list = []
             try:
                 def _on_reply_start(ev):
@@ -134,13 +138,13 @@ class BaseOrchestrator(ABC):
                     if apply:
                         apply.append_event(event)
                     # 实时透传事件给上层
-                    yield f"data: {event.model_dump_json()}\n\n"
+                    yield f"data: {serialize_agent_event(event)}\n\n"
                     # 工具一结束立即下发 bocha_sum：正文 {n} 标注依赖来源列表，
                     # 先于正文 delta 到达前端，便于边渲染正文边映射引用
                     if isinstance(event, _ToolResultEnd):
                         early_bocha = tracer.consume_bocha_sum()
                         if early_bocha:
-                            bocha_emitted.extend(early_bocha)
+                            bocha_emitted = merge_bocha_snapshots(bocha_emitted, early_bocha)
                             yield (
                                 "data: "
                                 + json.dumps(
@@ -192,11 +196,11 @@ class BaseOrchestrator(ABC):
                 + "\n\n"
             )
 
-        # emit 流末残余的 bocha_sum：循环内 consume 之后新捕获的部分合并进
-        # 快照累积再发全量；已发过且无残余时不再重复发（最后一个事件已含全量）
+        # emit 流末残余的 bocha_sum：残余快照按 citation_id 合并，无新编号时内容不变；
+        # 已发过且无残余时不再重复发（最后一个事件已含全量）
         residual_bocha = tracer.consume_bocha_sum()
         if residual_bocha:
-            bocha_emitted.extend(residual_bocha)
+            bocha_emitted = merge_bocha_snapshots(bocha_emitted, residual_bocha)
             yield (
                 "data: "
                 + json.dumps(

@@ -32,7 +32,13 @@ spec:
       terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets:
-        {{- toYaml . | nindent 8 }}
+        {{- range . }}
+        {{- if kindIs "string" . }}
+        - name: {{ . }}
+        {{- else }}
+        {{- toYaml (list .) | nindent 8 }}
+        {{- end }}
+        {{- end }}
       {{- end }}
       {{- with .Values.podSecurityContext }}
       securityContext:
@@ -118,6 +124,9 @@ spec:
           volumeMounts:
             - name: shared-data
               mountPath: {{ .Values.storage.mountPath }}
+              {{- if and (eq .Values.storage.type "pvc") .Values.storage.pvc.subPath }}
+              subPath: {{ .Values.storage.pvc.subPath }}
+              {{- end }}
             {{- with .Values.extraVolumeMounts }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
@@ -127,11 +136,14 @@ spec:
           hostPath:
             path: {{ required "storage.hostPath is required for hostPath storage" .Values.storage.hostPath }}
             type: Directory
+          {{- else if eq .Values.storage.type "pvc" }}
+          persistentVolumeClaim:
+            claimName: {{ include "cia-agentscope.fullname" . }}
           {{- else if eq .Values.storage.type "existingClaim" }}
           persistentVolumeClaim:
             claimName: {{ required "storage.existingClaim is required for existingClaim storage" .Values.storage.existingClaim }}
           {{- else }}
-          {{- fail "storage.type must be hostPath or existingClaim" }}
+          {{- fail "storage.type must be hostPath, pvc or existingClaim" }}
           {{- end }}
         {{- with .Values.extraVolumes }}
         {{- toYaml . | nindent 8 }}
