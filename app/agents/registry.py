@@ -255,6 +255,45 @@ class AgentRegistry:
             )
         react_config = ReActConfig()
         react_config.max_iters = 200
+
+        # 联网搜索可用性按本轮实际注册的工具判定（all_tools 由
+        # workspace_assembler 按 search_enabled 注入），提示词与函数
+        # 列表保持一致，避免模型被"提示词说有、函数列表说没有"的
+        # 矛盾信息驱动去沙箱目录翻找搜索技能
+        has_web_search = any(
+            getattr(t, "name", None) == "bocha_web_search"
+            for t in self._all_tools
+        )
+        if has_web_search:
+            external_info_guidance = (
+                "\n你仅允许通过系统内置的技能/工具获取外部信息（如联网搜索、"
+                "知识库查询等），禁止自行使用curl、wget、requests或其他方式"
+                "直接访问外部接口；禁止下载、安装额外的依赖包。若现有信息"
+                "不足以解答用户问题，请如实告知、或尝试挖掘已有线索进行处理。"
+            )
+        else:
+            external_info_guidance = (
+                "\n你仅允许通过系统内置的技能/工具获取外部信息（如知识库查询等），"
+                "禁止自行使用curl、wget、requests或其他方式直接访问外部接口；"
+                "禁止下载、安装额外的依赖包。本轮未开启联网搜索：涉及实时信息"
+                "（新闻、天气、股价等）时，请直接告知用户当前无法联网检索并"
+                "基于已有知识作答（注明可能非最新）。禁止在沙箱目录中查找、"
+                "阅读或尝试执行搜索技能与脚本。若现有信息不足以解答用户问题，"
+                "请如实告知、或尝试挖掘已有线索进行处理。"
+            )
+
+        # 本智能体无绑定技能时不下发技能目录使用说明，避免引导模型
+        # 翻找 /workspace/skills/（目录中物理存在但本轮未启用的技能文件）
+        bound_skill_names = set(definition.skills) | self._extra_skill_names
+        skill_dir_guidance = (
+            "\n当你调用技能时，必须在/workspace/skills目录下找到技能的说明文件"
+            "SKILL.md并阅读说明，阅读完成后才能继续执行。注意：只有函数列表中"
+            "已注册对应工具的技能才可使用；目录中存在但函数列表无对应工具的"
+            "技能（如本轮未开启的联网搜索）一律不可用，禁止翻找或执行其脚本。"
+            if bound_skill_names
+            else ""
+        )
+
         agent = Agent(
             name=definition.name,
             system_prompt=definition.system_prompt
@@ -263,8 +302,8 @@ class AgentRegistry:
             + "\n用户本轮上传的文件内容会直接附在用户问题里，请直接阅读使用。此外，本会话此前轮次上传文件的解析副本存放在工作目录 uploads/ 下（文件名为 <原文件名>.md）：当用户点名或指代历史文件时，可读取 uploads/ 下对应文件获取内容。"
             + "\n当你生成文件时，生成的文件内容只要用户不做特殊说明应该以中文为主。"
             + "\n当用户要求修改文件时，必须生成新文件名（如添加版本号、时间戳或_modified后缀），严禁直接覆盖原文件，以防止数据丢失。"
-            + "\n你仅允许通过系统内置的技能/工具获取外部信息（如联网搜索、知识库查询等），禁止自行使用curl、wget、requests或其他方式直接访问外部接口；禁止下载、安装额外的依赖包。若现有信息不足以解答用户问题，请如实告知、或尝试挖掘已有线索进行处理。"
-            + "\n当你调用技能时，必须在/workspace/skills目录下找到技能的说明文件SKILL.md并阅读说明，阅读完成后才能继续执行，你的所有技能文件已装载到该目录下。",
+            + external_info_guidance
+            + skill_dir_guidance,
             model=model,
             toolkit=toolkit,
             state=agent_state,

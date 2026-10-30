@@ -96,7 +96,7 @@ async def proxy_system_feedback_add(request: Request, user: dict = Depends(curre
 
 @router.get("/api/portal/notifications")
 async def proxy_public_active(request: Request, user: dict = Depends(current_user)):
-    """通知接口透传：前端 GET /api/portal/notifications → mng GET /api/public/active，响应原样返回。"""
+    """通知接口透传：前端 GET /api/portal/notifications → mng GET api/notifications/public/active，响应原样返回。"""
     if not MNG_INTENT_URL:
         # 本地开发兜底：仅 AUTH_MOCK=true 时读 mock（文件缺失返回空数据封包）；生产维持 500
         if _is_auth_mock():
@@ -106,7 +106,7 @@ async def proxy_public_active(request: Request, user: dict = Depends(current_use
     # follow_redirects：mng 部分路由注册带尾部斜杠会 307，同源重定向会保留 Authorization 头
     async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
         resp = await client.get(
-            f"{MNG_INTENT_URL}/api/public/active",
+            f"{MNG_INTENT_URL}/api/notifications/public/active",
             headers={"Authorization": f"Bearer {jwt_token}"},
             params=dict(request.query_params),
         )

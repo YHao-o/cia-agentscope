@@ -61,6 +61,7 @@ UPLOAD_ALLOWED_MEDIA_TYPES = [
     "application/vnd.openxmlformats-officedocument.presentationml.presentation",  # pptx
     "application/wps-office.xlsx",
     "application/wps-office.docx",
+    "application/wps-office.pptx",
     # 音频（上传时调用音频转写模型解析）
     "audio/mpeg",  # mp3
     "audio/mp4",  # m4a
@@ -141,3 +142,11 @@ SENSITIVE_SERVICE_URL = os.getenv("SENSITIVE_SERVICE_URL", "")
 SENSITIVE_THRESHOLD = float(os.getenv("SENSITIVE_THRESHOLD", "0.7"))
 # 调用超时（秒），超时兜底放行
 SENSITIVE_TIMEOUT = float(os.getenv("SENSITIVE_TIMEOUT", "5"))
+
+# ---- 输入围栏：大模型 403 预检 ----
+# true 时用户输入先直发业务模型做最小探测（max_tokens=1）：推理引擎内容
+# 安全拦截（403）即本轮直接返回敏感提示、不进入编排；
+# false 时跳过预检，由生成阶段 error 事件的 403 替换兜底
+LLM_INPUT_PROBE_ENABLED = os.getenv("LLM_INPUT_PROBE_ENABLED", "true").strip().lower() in (
+    "1", "true", "yes", "on",
+)

@@ -62,6 +62,14 @@ class OpenSandboxToolAdapter:
         """读取文件内容。"""
         return await self._sandbox.files.read_file(path)
 
+    # ---- Read bytes 等价 ----
+    async def read_bytes(self, path: str) -> bytes:
+        """读取文件原始字节（execd 文件下载接口，适合图片等二进制）。
+
+        走 HTTP 文件通道而非 shell stdout，不受命令输出大小上限影响。
+        """
+        return await self._sandbox.files.read_bytes(path)
+
     # ---- Write 等价 ----
     async def write(self, path: str, content: str) -> None:
         """写入文件。"""

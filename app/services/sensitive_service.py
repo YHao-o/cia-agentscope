@@ -43,10 +43,15 @@ def _fallback(source: str, reason: str = "") -> Dict[str, Any]:
     return result
 
 
+# 敏感拦截统一前端文案：输入阶段检测命中与大模型 403（安全拦截）共用，
+# 保证两阶段触达前端的提示一致
+SENSITIVE_BLOCK_MESSAGE = "您的输入中涉及安全或敏感问题，不予显示"
+
+
 def build_message_replace_event(result: Dict[str, Any], stage: str) -> Dict[str, Any]:
     """根据检测结果构造 message_replace 事件（命中时前端替换消息并停止接收）。"""
     reason = str(result.get("reason", "") or "").strip()
-    message = "您的输入中涉及安全或敏感问题，不予显示"
+    message = SENSITIVE_BLOCK_MESSAGE
     # if reason:
     #     message = f"您的内容涉及敏感词（{reason}），请修改提问"
     return {

@@ -30,6 +30,20 @@ models:
       # 过大的声明值会与长 prompt 叠加超出 40K 输入限制，被严格引擎拒绝
       max_tokens: 4096
 
+  # 输入围栏预检专用模型（llm-403 预检）
+  # 用户输入直发本模型做 max_tokens=1 最小探测，仅关心推理引擎内容安全
+  # 检查（403）是否放行，不消费输出；可配更便宜/更快的模型。
+  # 本段缺失时回退 default 配置（仍创建独立客户端，不与其他环节共用）
+  input_guard:
+    provider: 'openai'
+    model_name: 'deepseek-v4-flash'
+    base_url: 'https://geekai.co/api/v1'
+    api_key: 'sk-wmLT9mlv64VAodlLjuJvWsTToAQQVunJMQK4ISZQS9U7RIAJ'
+    parameters:
+      temperature: 0.1
+      # 预检只看网关是否放行，1 token 足够
+      max_tokens: 1
+
 # 兼容旧版：单智能体时代的 Agent 配置（保留作为 general_agent 的默认值来源）
 agent:
   name: 'AI问答助手'

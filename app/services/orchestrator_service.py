@@ -53,7 +53,10 @@ from app.services.user_config_service import (
     build_and_cache_user_config as user_config_build_and_cache,
     load_config_bundle,
 )
-from app.services.workspace_assembler import assemble_workspace_components
+from app.services.workspace_assembler import (
+    _SEARCH_SKILL_NAME,
+    assemble_workspace_components,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +96,8 @@ class OrchestratorService:
         workspace_manager: OpenSandboxWorkspaceManager,
         explicit_only_agents: Optional[List[str]] = None,
         agent_bound_tools: Optional[dict] = None,
+        input_probe_client: Optional[AsyncOpenAI] = None,
+        input_probe_model_cfg: Optional[dict] = None,
     ):
         self._model_config = model_config
         self._prompts = prompts
@@ -108,6 +113,10 @@ class OrchestratorService:
         self._explicit_only_agents: set = set(explicit_only_agents or [])
         # 工具智能体绑定：声明的工具只注入给指定智能体（工具名 → 智能体 id 列表）
         self._agent_bound_tools: dict = dict(agent_bound_tools or {})
+        # 输入围栏 403 预检专用客户端（models.input_guard 配置段，
+        # 与 summary/intent 客户端完全独立；None 时预检自动跳过）
+        self._input_probe_client = input_probe_client
+        self._input_probe_model_cfg = input_probe_model_cfg
         # 注意：本服务是全局单例，不持有任何请求级状态（agent_ids /
         # success / token 计数 / 消费的上传文件 id 均由每轮独立的
         # RoundState 承载，见 round_state.py），避免并发请求互相覆盖
@@ -130,6 +139,13 @@ class OrchestratorService:
         intent_client = create_async_client(intent_model_cfg)
         # 并行编排结果汇总用客户端（默认业务大模型）
         summary_client = create_async_client(default_model_cfg)
+        # 输入围栏 403 预检专用客户端（models.input_guard 配置段）：
+        # 独立实例、独立配置，不与意图识别/汇总共用；段缺失时回退 default
+        # 配置但仍创建新客户端
+        input_probe_model_cfg = model_config.get("models", {}).get(
+            "input_guard", default_model_cfg
+        )
+        input_probe_client = create_async_client(input_probe_model_cfg)
         prompts = model_config.get("prompts", {})
 
         # 编排器参数仍从 intent_config.yml 读取一次（这些属于系统级配置，不变）
@@ -159,6 +175,8 @@ class OrchestratorService:
             workspace_manager=workspace_manager,
             explicit_only_agents=explicit_only_agents,
             agent_bound_tools=agent_bound_tools,
+            input_probe_client=input_probe_client,
+            input_probe_model_cfg=input_probe_model_cfg,
         )
 
     def _create_model_fn(self, message_pair_id: Optional[str] = None):
@@ -275,6 +293,39 @@ class OrchestratorService:
     async def _load_config_bundle(self, user_id: str, redis_client) -> dict:
         """读取登录时缓存的融合配置，未命中 base-only 兜底（委托 user_config_service）。"""
         return await load_config_bundle(user_id, redis_client)
+
+    async def _search_blocked_by_mng(
+        self, user_id: Optional[str], redis_client
+    ) -> bool:
+        """mng 联网搜索权限校验：用户 skill_blacklist 含 bocha_search 返回 True。
+
+        权限读取自 Redis（登录时 mng 下发的 permissions 原样缓存，
+        key 见 auth_service._REDIS_KEY_PERMISSIONS）。未登录/无缓存/
+        读取异常均按放行处理——与"权限服务异常不阻断对话"的既有
+        降级策略一致；mng 拉黑的用户在下次登录时生效。
+        """
+        if not user_id or redis_client is None:
+            return False
+        try:
+            from app.services.auth_service import get_user_permissions
+            from app.services.mng_service import build_blacklist_codes
+
+            perms_data = await get_user_permissions(redis_client, user_id)
+            permissions = (perms_data or {}).get("permissions") or {}
+            blacklist = build_blacklist_codes(
+                permissions.get("skill_blacklist", [])
+            )
+            if _SEARCH_SKILL_NAME in blacklist:
+                logger.info(
+                    f"[OrchestratorService] 用户 {user_id} "
+                    f"联网搜索已被 mng skill_blacklist 禁用"
+                )
+                return True
+        except Exception:
+            logger.exception(
+                "[OrchestratorService] 读取用户联网搜索权限失败，按放行处理"
+            )
+        return False
 
     async def _resolve_workspace_task(
         self, ws_task: "asyncio.Task", round_state: RoundState
@@ -606,6 +657,14 @@ class OrchestratorService:
         redis_client = None
         if request is not None:
             redis_client = getattr(request.app.state, "redis_client", None)
+
+        # mng 权限管控：用户 skill_blacklist 含 bocha_search 时强制关闭
+        # 联网搜索（工具注入与技能装载双通道同步收口）；前端
+        # search_enabled 开关仅在 mng 未拉黑的前提下生效
+        if search_enabled and await self._search_blocked_by_mng(
+            user_id, redis_client
+        ):
+            search_enabled = False
 
         user_id_safe = user_id or "anonymous"
         session_id_safe = session_id or f"ephemeral-{user_id_safe}"

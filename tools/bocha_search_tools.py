@@ -138,7 +138,7 @@ def create_bocha_search_tool() -> FunctionTool:
     sources: list = []
     url_to_id: dict = {}
 
-    async def bocha_web_search(query: str) -> ToolChunk:
+    async def bocha_web_search(query: str = "") -> ToolChunk:
         """调用博查搜索API，搜索互联网上的最新信息和实时数据。
 
         当用户询问最新消息、实时信息（新闻、天气、股价等）或需要
@@ -147,8 +147,15 @@ def create_bocha_search_tool() -> FunctionTool:
         Args:
             query: 搜索关键词，简洁明了，至少 1 个字符
         """
+        # query 设默认值而非必填：私有推理引擎偶发首调用空参 {}，
+        # 必填签名会在框架参数校验层抛 TypeError（ERROR 态事件直发前端，
+        # 用户可见"执行失败 {}"）。改为默认空串后空参调用落到此处，
+        # 以正常状态返回提示文案，模型读后自行补参重试，前端无感。
         if not query or not query.strip():
-            return _build_result("错误：搜索关键词不能为空。")
+            return _build_result(
+                "搜索关键词为空。请携带明确的搜索关键词（query 参数）"
+                "重新调用本工具。"
+            )
 
         if not BOCHA_API_KEY:
             return _build_result("搜索服务未配置，请联系管理员。")

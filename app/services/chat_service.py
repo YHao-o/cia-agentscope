@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import asyncio
+import re
 import time
 import uuid
 from contextlib import contextmanager
@@ -21,11 +22,12 @@ import yaml
 from agentscope.credential import OpenAICredential
 from agentscope.model import OpenAIChatModel
 
-from app.config import MODEL_CONFIG_PATH, SESSION_FILES_PERSIST_DIR
+from app.config import LLM_INPUT_PROBE_ENABLED, MODEL_CONFIG_PATH, SESSION_FILES_PERSIST_DIR
 from app.services.file_change_detector import diff, filter_allowed
 from app.services.langfuse_service import LangfuseService, derive_trace_id
 from app.services.round_state import RoundState
 from app.services.sensitive_service import (
+    SENSITIVE_BLOCK_MESSAGE,
     build_message_replace_event,
     check_sensitive,
     dict_check_sensitive,
@@ -65,6 +67,106 @@ def _compute_ttft_marker(event_type: str) -> bool:
 
 # 编排链路 error 事件的统一前端兜底文案（原始错误信息只进日志）
 _FRIENDLY_ERROR_MESSAGE = "抱歉，暂时无法生成回复。请重试并联系管理员"
+
+# 大模型 403 判定：推理引擎安全拦截时以 HTTP 状态码或业务 code 返回 403，
+# 错误信息会内嵌在异常文本里（如 "Error code: 403 - ..."）。按词边界匹配，
+# 避免误命中 4030 等数字串；误判代价仅为文案替换，无安全影响。
+_LLM_403_PATTERN = re.compile(r"\b403\b", re.IGNORECASE)
+
+
+def _is_llm_403_error(message: str) -> bool:
+    """判断错误文本是否为大模型 403 拦截（状态码 403 或业务 code 403）。"""
+    return bool(message) and bool(_LLM_403_PATTERN.search(message))
+
+
+async def _probe_llm_input_403(orchestrator_service, text: str) -> bool:
+    """输入围栏预检：用户输入直发围栏专用模型做最小探测，命中 403 返回 True。
+
+    使用独立的 models.input_guard 配置段（orchestrator 上的
+    _input_probe_client/_input_probe_model_cfg，与意图识别/汇总客户端
+    完全独立），max_tokens 默认 1 —— 只关心请求能否通过推理引擎的
+    内容安全检查，不消费模型输出。任何非 403 异常（超时/网络/5xx）
+    一律放行（fail-open），生成阶段 error 事件层的 403 替换仍作兜底。
+
+    403 复核（对照探测）：用户输入命中 403 后，再用固定无害文本
+    （"你好"）探测一次。对照同样 403 → 判定为网关级故障（配额耗尽/
+    鉴权失效等，此时 /health/llm 存活探测也会 403），本轮放行，
+    避免全量用户被误拦；对照通过 → 才是真实的内容安全拦截。
+    """
+    if not LLM_INPUT_PROBE_ENABLED:
+        return False
+    client = getattr(orchestrator_service, "_input_probe_client", None)
+    model_cfg = getattr(orchestrator_service, "_input_probe_model_cfg", None)
+    if not client or not model_cfg or not (text or "").strip():
+        return False
+    parameters = model_cfg.get("parameters", {}) or {}
+
+    async def _probe(content: str) -> bool:
+        """单次探测：返回是否命中 403。非 403 异常视为未命中。"""
+        try:
+            await client.chat.completions.create(
+                model=model_cfg.get("model_name", "deepseek-chat"),
+                messages=[
+                    {"role": "system", "content": "你是一个助手。"},
+                    {"role": "user", "content": content},
+                ],
+                max_tokens=parameters.get("max_tokens", 1),
+                temperature=parameters.get("temperature", 0.1),
+                timeout=8.0,
+                extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+            )
+            return False
+        except Exception as e:
+            if _is_llm_403_error(str(e)):
+                return True
+            logger.warning(
+                "[chat_service] 输入 403 预检异常（非 403，放行）: %s", e
+            )
+            return False
+
+    if not await _probe(text):
+        return False
+    # 用户输入 403 → 对照复核，区分内容拦截与网关级故障
+    if await _probe("你好"):
+        logger.warning(
+            "[chat_service] 输入 403 预检：对照探测同样 403，"
+            "判定为网关级故障（配额/鉴权），本轮放行"
+        )
+        return False
+    logger.warning("[chat_service] 输入 403 预检命中，本轮以敏感文案拦截")
+    return True
+
+
+def _block_stream_events(message: str, message_pair_id: str) -> List[str]:
+    """构造输入拦截轮的标准流式事件序列（开始 → 正文 → 任务结束 → 收尾）。
+
+    与正常编排流同构：orchestration_start → pipeline_intercept（拦截文案
+    走该事件通道下发）→ task_end → summary → files_generated（空文件
+    列表，携带 message_pair_id 供前端完成本轮收尾绑定）。前端无需专门
+    实现 message_replace 解析，拦截文案即按普通流式正文渲染并正常收尾
+    （message_replace 仅输出阶段拦截仍在使用，彼时正文已流出，
+    替换语义不可少）。task_end 的 success=True 表示本轮已产出最终回答
+    （拦截文案即答案），前端走正常完成态而非错误态。
+    """
+    events = [
+        {"type": "orchestration_start", "mode": "sensitive_block"},
+        {"type": "pipeline_intercept", "message": message},
+        {
+            "type": "task_end",
+            "intent_id": "sensitive_block",
+            "agent_id": "",
+            "success": True,
+        },
+        {"type": "summary", "content": message},
+        {
+            "type": "files_generated",
+            "files": [],
+            "message_pair_id": message_pair_id,
+        },
+    ]
+    return [
+        f"data: {json.dumps(e, ensure_ascii=False)}\n\n" for e in events
+    ]
 
 
 async def _generate_recommended_questions(
@@ -637,6 +739,9 @@ async def generate_response(
     text_delta_seen = False
     # 本轮编排流是否出现过 error 事件（前端文案兜底 + 落库兜底的触发标志）
     error_occurred = False
+    # error 事件实际下发给前端的文案（403 → 敏感提示，其余 → 通用兜底）；
+    # 无输出轮落库时复用，保证会话历史与前端所见一致
+    chosen_error_message = _FRIENDLY_ERROR_MESSAGE
     # 兜底输出：当无 summary 时（如 pipeline 失败终止、react 无 action 终止），
     # 用 pipeline_intercept.message / react_final.conclusion 作为 final_output，
     # 保证失败轮次也能持久化 assistant 消息
@@ -706,14 +811,17 @@ async def generate_response(
                         logger.warning("[chat_service] 流首保存 trace_id 失败", exc_info=True)
             # ③.5 用户输入敏感检测（纯词典，低延迟）。
             # 置于根 span 内执行，使 sensitive-dict-check span 嵌套在本轮会话
-            # trace 中（而非形成独立 trace）；命中则发 message_replace 并结束本轮，
-            # 不进入编排主流程，也不持久化消息
+            # trace 中（而非形成独立 trace）；命中则以标准流式事件序列
+            # （开始/正文/结束）下发拦截文案并结束本轮，
+            # 不进入编排主流程，拦截轮照常落库（刷新会话可见）
             sens_input = await dict_check_sensitive(
                 _extract_user_input(messages), stage="input"
             )
             if sens_input["blocked"]:
-                replace_event = build_message_replace_event(sens_input, stage="input")
-                yield f"data: {json.dumps(replace_event, ensure_ascii=False)}\n\n"
+                for ev in _block_stream_events(
+                    SENSITIVE_BLOCK_MESSAGE, message_pair_id
+                ):
+                    yield ev
                 _safe_update_span(root_obs, {
                     "reply": "",
                     "session_id": session_id,
@@ -721,6 +829,49 @@ async def generate_response(
                     "sensitiveBlocked": True,
                     "blockedStage": "input",
                 })
+                # 拦截轮同样落库（用户输入 + 拦截文案），
+                # 刷新会话后该轮可见；orchestration 未执行，
+                # round_state.consumed_upload_ids 为空 → 不绑定上传文件
+                await _persist_conversation_history(
+                    session_service, session_id, user_id,
+                    messages, SENSITIVE_BLOCK_MESSAGE,
+                    upload_file_dao=getattr(
+                        request.app.state, "upload_file_dao", None
+                    ) if request is not None else None,
+                    message_pair_id=message_pair_id,
+                    round_state=round_state,
+                )
+                return
+
+            # ③.6 输入围栏（大模型 403 预检）：将用户输入直发业务模型做最小
+            # 探测（max_tokens=1），推理引擎内容安全拦截（403）时立即以敏感
+            # 文案结束本轮——避免进入编排后才在生成阶段被拦，浪费意图识别、
+            # 工具调用等轮次。非 403 异常（超时/网络/5xx）一律放行，
+            # 由 error 事件层的 403 替换兜底。
+            if await _probe_llm_input_403(
+                orchestrator_service, _extract_user_input(messages)
+            ):
+                for ev in _block_stream_events(
+                    SENSITIVE_BLOCK_MESSAGE, message_pair_id
+                ):
+                    yield ev
+                _safe_update_span(root_obs, {
+                    "reply": "",
+                    "session_id": session_id,
+                    "user_id": user_id,
+                    "sensitiveBlocked": True,
+                    "blockedStage": "input-llm-403",
+                })
+                # 拦截轮同样落库（与词典命中路径一致）
+                await _persist_conversation_history(
+                    session_service, session_id, user_id,
+                    messages, SENSITIVE_BLOCK_MESSAGE,
+                    upload_file_dao=getattr(
+                        request.app.state, "upload_file_dao", None
+                    ) if request is not None else None,
+                    message_pair_id=message_pair_id,
+                    round_state=round_state,
+                )
                 return
 
             # ④ 执行编排主流程，实时透传 SSE 事件
@@ -755,16 +906,24 @@ async def generate_response(
 
                 if event_type == "error":
                     error_occurred = True
+                    original_error = str(payload.get("message", ""))
                     logger.warning(
                         "[chat_service] 编排错误（前端已兜底）: %s",
-                        payload.get("message", ""),
+                        original_error,
                     )
+                    # 大模型 403（安全拦截）→ 敏感提示文案；其余 → 通用兜底文案。
+                    # chosen_error_message 供无输出轮的落库兜底复用，保证
+                    # 前端所见与会话历史记录一致
+                    if _is_llm_403_error(original_error):
+                        chosen_error_message = SENSITIVE_BLOCK_MESSAGE
+                    else:
+                        chosen_error_message = _FRIENDLY_ERROR_MESSAGE
                     yield (
                         "data: "
                         + json.dumps(
                             {
                                 "type": "error",
-                                "message": _FRIENDLY_ERROR_MESSAGE,
+                                "message": chosen_error_message,
                             },
                             ensure_ascii=False,
                         )
@@ -796,6 +955,18 @@ async def generate_response(
                         # 较旧/无变化快照：丢弃，避免前端覆盖式渲染回退
                         collected_bocha_sum = merged_bocha
                 else:
+                    # pipeline_intercept 消息内嵌 agent 原始错误文本（含引擎
+                    # 报错细节），命中大模型 403 时替换为敏感提示文案再透传，
+                    # 避免安全拦截原文直达前端；其余情况维持原样透传
+                    if event_type == "pipeline_intercept" and _is_llm_403_error(
+                        str(payload.get("message", ""))
+                    ):
+                        payload["message"] = SENSITIVE_BLOCK_MESSAGE
+                        event_str = (
+                            "data: "
+                            + json.dumps(payload, ensure_ascii=False)
+                            + "\n\n"
+                        )
                     yield event_str
 
                 # 解析事件：提取 summary 收集输出 + 检测 CUSTOM_COMPONENT 并转发
@@ -854,10 +1025,10 @@ async def generate_response(
             # 无 summary 时用失败终止事件文本兜底，保证失败轮次也有 assistant 记录
             if not final_output:
                 final_output = "\n".join(p for p in final_fallback_parts if p).strip()
-            # 报错轮兜底：无任何输出时用友好文案落库，保证会话历史该轮不空白
-            # （success=False 由编排层派生）
+            # 报错轮兜底：无任何输出时用（按 403 分流后的）文案落库，保证
+            # 会话历史该轮不空白；success=False 由编排层派生
             if not final_output and error_occurred:
-                final_output = _FRIENDLY_ERROR_MESSAGE
+                final_output = chosen_error_message
 
             # content_parts 兜底：整轮没收到正文流式 delta（降级链路只发
             # summary）时，用 final_output 补一个 text part，保证不缺正文

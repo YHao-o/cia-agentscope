@@ -195,8 +195,12 @@ def _build_whitelist_mcp_map(agent_whitelist: list) -> dict:
     return mapping
 
 
-def _build_blacklist_codes(skill_blacklist: list) -> set:
-    """从 skill_blacklist 列表中提取所有 code，转为集合用于快速查找。"""
+def build_blacklist_codes(skill_blacklist: list) -> set:
+    """从 skill_blacklist 列表中提取所有 code，转为集合用于快速查找。
+
+    公共函数：除融合层过滤外部技能外，orchestrator 亦用它做
+    内置技能（bocha_search 联网搜索）的 mng 权限校验。
+    """
     codes = set()
     if not isinstance(skill_blacklist, list):
         return codes
@@ -245,7 +249,7 @@ def merge_external_into_memory(
     whitelist_mcp_map = _build_whitelist_mcp_map(
         permissions.get("agent_whitelist", []) if permissions else []
     )
-    skill_blacklist = _build_blacklist_codes(
+    skill_blacklist = build_blacklist_codes(
         permissions.get("skill_blacklist", []) if permissions else []
     )
 

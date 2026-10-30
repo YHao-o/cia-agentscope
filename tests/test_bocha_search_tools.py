@@ -142,14 +142,17 @@ def test_tool_factory_returns_named_tool():
 
 @pytest.mark.asyncio
 async def test_empty_query_rejected_without_http_call(monkeypatch):
-    """空/空白 query：直接返回错误文本，不发起 HTTP 请求。"""
+    """空/空白 query：直接返回提示文本（正常状态），不发起 HTTP 请求。"""
     _patch_config(monkeypatch)
     fake = _patch_httpx(monkeypatch)
     tool = create_bocha_search_tool()
 
+    expected = (
+        "搜索关键词为空。请携带明确的搜索关键词（query 参数）重新调用本工具。"
+    )
     for q in ("", "   "):
         chunk = await tool(query=q)
-        assert _chunk_text(chunk) == "错误：搜索关键词不能为空。"
+        assert _chunk_text(chunk) == expected
         assert chunk.metadata == {}
     assert fake.post_calls == []
 

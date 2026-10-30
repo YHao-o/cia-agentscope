@@ -51,16 +51,6 @@ _OPTIONAL_SKILLS = [
         "description": "根据数据生成可交互的 ECharts 图表（含中国/世界地图、词云），完全离线可用。",
     },
     {
-        "name": "academic-figures",
-        "nickname": "学术图表绘制",
-        "description": "绘制出版级学术图表，符合期刊规范，支持中文渲染与统计图形。",
-    },
-    {
-        "name": "gongwenformat-pro",
-        "nickname": "公文格式排版",
-        "description": "按 GB/T 9704-2012 党政机关公文格式标准，对 Word 公文自动排版。",
-    },
-    {
         "name": "unclecheng-reduce-ai-perception",
         "nickname": "去 AI 味润色",
         "description": "降低文本的 AI 生成痕迹，使用词、句式、结构更接近真人表达。",

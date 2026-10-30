@@ -599,8 +599,23 @@ class OpenSandboxWorkspaceManager:
             if self._is_text_rel(rel):
                 text = await adapter.read(abs_path)
                 return text.encode("utf-8") if isinstance(text, str) else bytes(text)
-            # 二进制：base64 解码
-            result = await adapter.bash(f"base64 -w0 {abs_path} 2>/dev/null || true")
+            # 二进制：优先走 execd 文件接口读原始字节。
+            # 原 base64 shell 通道把文件内容塞进命令 stdout，受沙箱
+            # 命令输出上限截断，大文件（如高分 png）读失败导致下载 404；
+            # 文件接口按字节传输无此限制。
+            try:
+                return await adapter.read_bytes(abs_path)
+            except Exception:
+                logger.warning(
+                    f"[opensandbox_ws] read_bytes 失败，回退 base64 "
+                    f"user={user_id} session={session_id} rel={rel_path}",
+                    exc_info=True,
+                )
+            # 回退：base64 shell 通道（路径做 shell 安全引用，防空格/特殊字符）
+            import shlex
+            result = await adapter.bash(
+                f"base64 -w0 {shlex.quote(abs_path)} 2>/dev/null || true"
+            )
             stdout = result.get("stdout", "") if isinstance(result, dict) else ""
             stdout = stdout.strip()
             if not stdout:
@@ -655,8 +670,9 @@ class OpenSandboxWorkspaceManager:
             if adapter is None:
                 return None
             abs_path = f"{self._session_dir(session_id)}/{rel}"
+            import shlex
             result = await adapter.bash(
-                f"stat -c %s {abs_path} 2>/dev/null || true"
+                f"stat -c %s {shlex.quote(abs_path)} 2>/dev/null || true"
             )
             stdout = result.get("stdout", "") if isinstance(result, dict) else ""
             stdout = stdout.strip()
