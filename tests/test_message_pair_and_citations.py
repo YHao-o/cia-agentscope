@@ -47,7 +47,7 @@ class _FakeCursor:
         sql = self.executed[-1][0] if self.executed else ""
         if "COUNT(*)" in sql:
             return self._count_row
-        if sql.startswith("SELECT name, agent_ids FROM sessions"):
+        if sql.startswith("SELECT name, agent_ids, deleted_at FROM sessions"):
             return self._session_row
         return None
 

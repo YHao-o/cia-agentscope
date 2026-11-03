@@ -24,13 +24,45 @@ def test_diff_excludes_upload_prefix():
         "uploads/报表.xlsx.md",      # persist 写入的解析文本
         "报告.docx",                  # 模型真实产物
     }
-    assert diff(before, after) == ["报告.docx", "uploads/报表.xlsx.md"]  # 不传排除时全保留
+    assert diff(before, after) == ["uploads/报表.xlsx.md", "报告.docx"]  # 不传排除时全保留
     assert diff(before, after, exclude_prefixes=("uploads/",)) == ["报告.docx"]
     # 边界：前缀 uploads/ 不误伤 uploads_report.docx 这类正常文件名
     after2 = after | {"uploads_v2.docx"}
     assert diff(before, after2, exclude_prefixes=("uploads/",)) == [
         "uploads_v2.docx", "报告.docx"
     ]
+
+
+def test_diff_dict_signature_detects_overwrite():
+    """带签名快照（dict）：同路径文件 mtime/size 变化（重生成/覆盖）
+    也算本轮产物；签名未变的旧文件不算。"""
+    before = {
+        "报告.docx": ("1770000000.0000000000", "1024"),
+        "数据.xlsx": ("1770000000.0000000000", "2048"),
+    }
+    after = {
+        # 覆盖重生成：mtime 与 size 都变了
+        "报告.docx": ("1770009999.1234567890", "2048"),
+        # 未变化
+        "数据.xlsx": ("1770000000.0000000000", "2048"),
+        # 新增
+        "图.png": ("1770008888.0000000000", "512"),
+    }
+    assert diff(before, after) == ["图.png", "报告.docx"]
+    # 排除前缀对 dict 快照同样生效
+    after["uploads/表格.csv.md"] = ("1770007777.0", "10")
+    assert diff(before, after, exclude_prefixes=("uploads/",)) == ["图.png", "报告.docx"]
+
+
+def test_diff_mixed_set_and_dict_falls_back_to_paths():
+    """set 与 dict 混用（如 mock 与真实快照混用）时退化为纯路径差集，
+    不误报签名变化。"""
+    before = {"报告.docx", "数据.xlsx"}
+    after = {
+        "报告.docx": ("1770009999.0", "2048"),  # 签名不同但路径已存在
+        "图.png": ("1770008888.0", "512"),
+    }
+    assert diff(before, after) == ["图.png"]
 
 
 def test_filter_allowed_extensions():

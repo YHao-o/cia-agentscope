@@ -69,18 +69,26 @@ def test_llm_health_ok(monkeypatch):
     assert data["latency_ms"] >= 0
 
 
-def test_llm_health_upstream_status_passthrough(monkeypatch):
-    """上游 401 → HTTP 401 + 上游报错信息。"""
-    response = httpx.Response(401, request=httpx.Request("POST", "http://llm.local/v1"))
-    exc = APIStatusError("Error code: 401 - invalid api key",
-                         response=response, body=None)
-    _patch_client(monkeypatch, _mock_client(raise_exc=exc))
+def test_llm_health_fake_key_401_alive(monkeypatch):
+    """虚构 key 被网关拒绝（401）→ 网关存活：200 + status ok。"""
+    captured = {}
+
+    def _factory(cfg, timeout=None):
+        captured["cfg"] = cfg
+        return _mock_client(raise_exc=APIStatusError(
+            "Error code: 401 - invalid api key",
+            response=httpx.Response(
+                401, request=httpx.Request("POST", "http://llm.local/v1")),
+            body=None,
+        ))
+
+    monkeypatch.setattr(health_route, "create_async_client", _factory)
     resp = TestClient(_make_app()).get("/health/llm")
-    assert resp.status_code == 401
+    assert resp.status_code == 200
     data = resp.json()
-    assert data["status"] == "error"
-    assert data["error"]["status_code"] == 401
-    assert "401" in data["error"]["message"]
+    assert data["status"] == "ok"
+    # 探测请求使用虚构 key，而非配置中的真实 key
+    assert captured["cfg"]["api_key"] != DEFAULT_CFG["api_key"]
 
 
 def test_llm_health_upstream_5xx_passthrough(monkeypatch):
