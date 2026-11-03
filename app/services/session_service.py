@@ -131,7 +131,7 @@ class SessionService:
         if deleted == 0:
             return {"deleted": 0, "session_deleted": False}
 
-        # 删空（会话中已无剩余消息）→ 整删会话（CASCADE 清理关联表）
+        # 删空（会话中已无剩余消息）→ 整删会话（逻辑删除：子表数据保留）
         if await self.dao.count_messages(session_id) == 0:
             await self.dao.delete_session(session_id, user_id)
             return {"deleted": deleted, "session_deleted": True}

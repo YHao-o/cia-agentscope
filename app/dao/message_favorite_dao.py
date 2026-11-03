@@ -51,6 +51,7 @@ class MessageFavoriteDAO:
             "m.citations, m.bocha_sum "
             f"FROM messages m WHERE m.user_id = %s "
             f"AND m.message_pair_id IN ({placeholders}) "
+            "AND m.deleted_at IS NULL "
             "ORDER BY m.id ASC"
         )
         args = [favorite_id, title, user_id] + list(message_pair_ids)
@@ -79,6 +80,7 @@ class MessageFavoriteDAO:
                         "SELECT content FROM messages "
                         f"WHERE user_id = %s "
                         f"AND message_pair_id IN ({placeholders}) "
+                        "AND deleted_at IS NULL "
                         "AND role = 'user' ORDER BY id ASC LIMIT 1",
                         [user_id] + list(message_pair_ids),
                     )

@@ -443,7 +443,7 @@ def _persist_file_bytes(persist_dir: str, session_id: str, rel_path: str, conten
 
 async def _detect_and_emit_files(
     session_id: Optional[str],
-    before_files: set,
+    before_files: dict | set,
     session_service: Any,
     workspace_manager: Any = None,
     user_id: str = "",
@@ -718,8 +718,40 @@ async def generate_response(
     命中时 yield message_replace 事件并结束本轮、不持久化；final_output 命中敏感时
     yield message_replace 事件并跳过推荐问题，持久化与文件检测仍执行。
     """
-    def _cancelled() -> bool:
-        return cancel_event is not None and cancel_event.is_set()
+    # 取消检查：本地 event（同 Pod /chat/stop set）或 Redis 停止标志
+    # chat_stop:{session_id}（K8s 多副本下 /chat/stop 可能路由到其他 Pod）。
+    # Redis 查询按 monotonic 时间节流：同一秒内最多真实查询一次（缓存上次
+    # 结果与时间戳）；本地 event 已 set 时直接 True 不查 Redis。
+    # redis_client 缺失或 Redis 异常 → 仅本地判断，异常只告警一次避免刷屏。
+    redis_client = (
+        getattr(request.app.state, "redis_client", None)
+        if request is not None else None
+    )
+    stop_key = f"chat_stop:{session_id}" if session_id else None
+    _redis_warned = False
+    _last_redis_check = 0.0
+    _last_redis_stopped = False
+
+    async def _cancelled() -> bool:
+        nonlocal _redis_warned, _last_redis_check, _last_redis_stopped
+        if cancel_event is not None and cancel_event.is_set():
+            return True
+        if redis_client is None or stop_key is None:
+            return False
+        now = time.monotonic()
+        if now - _last_redis_check < 1.0:
+            return _last_redis_stopped
+        _last_redis_check = now
+        try:
+            _last_redis_stopped = bool(await redis_client.exists(stop_key))
+            return _last_redis_stopped
+        except Exception:
+            if not _redis_warned:
+                logger.warning(
+                    "[chat_service] 查询 Redis 停止标志失败", exc_info=True
+                )
+                _redis_warned = True
+            return False
 
     # ① 加载历史（限 3 轮）并合并当前输入
     history_messages = await _load_history_messages(session_service, session_id)
@@ -752,8 +784,9 @@ async def generate_response(
     ttft_ms = None
     aborted_at_ms = None
 
-    # ② 快照工作目录（用于结束后检测新文件）
-    before_files: set = set()
+    # ② 快照工作目录（用于结束后检测新文件：{路径: (mtime, size)} 签名，
+    #    同路径文件被重生成/覆盖也能识别为本轮产物）
+    before_files: dict = {}
     # 本轮对话配对 id：user/assistant 消息与生成/上传文件共享
     message_pair_id = uuid.uuid4().hex
     # 本轮运行时状态（agent_ids / success / token / 消费的上传文件 id）：
@@ -890,7 +923,7 @@ async def generate_response(
                 round_state=round_state,
             ):
                 # 取消检查点：每个事件之间检测一次（LLM chunk 之间会回到本循环）
-                if _cancelled():
+                if await _cancelled():
                     aborted = True
                     aborted_at_ms = int((time.perf_counter() - t0) * 1000)
                     raise asyncio.CancelledError()
@@ -1039,7 +1072,7 @@ async def generate_response(
                 })
 
             # 编排流结束后的取消检查（避免后续步骤继续执行）
-            if _cancelled():
+            if await _cancelled():
                 aborted = True
                 aborted_at_ms = int((time.perf_counter() - t0) * 1000)
                 raise asyncio.CancelledError()

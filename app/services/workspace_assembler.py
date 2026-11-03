@@ -3,15 +3,50 @@
 从 orchestrator_service.py 外移。延迟导入（chart/md/policy/bocha 工具、
 adapter、bridge）保持函数内导入，避免模块级循环依赖。
 """
+import logging
 from contextlib import contextmanager
-from typing import Any, Iterator, List, Optional
+from typing import Any, Iterator, List, Optional, Set
 
 from app.agents.base import AgentDefinition
 from app.agents.factory import AgentFactory
 from app.agents.registry import AgentRegistry
 
+logger = logging.getLogger(__name__)
+
 # 联网搜索技能名（与 skill_config.yml / agent_config.yml 中的 name 一致）
 _SEARCH_SKILL_NAME = "bocha_search"
+
+
+async def _load_skill_blacklist(redis_client, user_id: str) -> Set[str]:
+    """从 Redis 用户权限读取 skill_blacklist 的 code 集合。
+
+    安全：请求级附加技能（extra_skill_names）的越权过滤依据。
+    Redis 未配置 / 无权限缓存 / 解析失败均返回空集合（退化为不过滤，
+    与融合阶段 mng_service 的失败语义一致），异常仅告警不阻断。
+    """
+    if redis_client is None or not user_id:
+        return set()
+    try:
+        from app.services.auth_service import get_user_permissions
+        cached = await get_user_permissions(redis_client, user_id)
+        if not cached:
+            return set()
+        blacklist = (cached.get("permissions") or {}).get("skill_blacklist") or []
+        codes: Set[str] = set()
+        for item in blacklist:
+            if isinstance(item, dict):
+                code = item.get("code")
+            else:
+                code = item
+            if code:
+                codes.add(code)
+        return codes
+    except Exception:
+        logger.warning(
+            "[workspace_assembler] 读取用户 skill_blacklist 失败，"
+            "本轮附加技能不做黑名单过滤", exc_info=True,
+        )
+        return set()
 
 
 @contextmanager
@@ -164,6 +199,17 @@ async def assemble_workspace_components(
     extra_skills = list(skills or [])
     if search_enabled:
         extra_skills.append(_SEARCH_SKILL_NAME)
+    # 安全：附加技能统一过 skill_blacklist（融合阶段仅过滤 agent 绑定技能，
+    # extra 若不过滤，前端传入（或后端追加的 bocha_search）可绕过黑名单越权使用）
+    blacklist = await _load_skill_blacklist(redis_client, user_id)
+    if blacklist:
+        filtered = [s for s in extra_skills if s not in blacklist]
+        if len(filtered) != len(extra_skills):
+            logger.info(
+                "[workspace_assembler] 已过滤黑名单附加技能 "
+                f"user={user_id} 命中={[s for s in extra_skills if s in blacklist]}"
+            )
+        extra_skills = filtered
 
     registry = AgentRegistry(
         definitions=agent_defs,

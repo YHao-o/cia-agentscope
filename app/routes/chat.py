@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
@@ -12,6 +13,8 @@ from app.models.chat import ChatRequest
 from app.services.chat_service import generate_response
 from app.services.feedback_service import cancel_feedback, resolve_feedback
 from app.dao.user_dao import fire_notify_mng_active
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -132,6 +135,13 @@ async def chat(request: Request, body: ChatRequest, user: dict = Depends(current
         finally:
             # 流结束（正常/异常/中断）后清理注册表与挂起反馈
             request.app.state.chat_tasks.pop(session_id, None)
+            # 同步删除 Redis 停止标志（跨 Pod 中断用），避免残留影响同 session 后续请求
+            try:
+                redis_client = getattr(request.app.state, "redis_client", None)
+                if redis_client is not None:
+                    await redis_client.delete(f"chat_stop:{session_id}")
+            except Exception:
+                logger.warning("[chat] 清理 Redis 停止标志失败", exc_info=True)
             cancel_feedback(session_id)
 
     try:
@@ -152,8 +162,19 @@ async def stop_chat(
     触发对应 session_id 的 cancel_event，generate_response 检测到后
     主动 raise CancelledError 进入 finally：落库（success=False）+
     flush trace + yield user_abort 事件。本接口立即返回，不等待中断完成。
+    K8s 多副本下另写 Redis 停止标志（EX 300），使运行在其他 Pod 上的
+    流式生成也能在检查点轮询到并中断。
     """
     session_id = body.session_id
+    # 无条件写 Redis 停止标志（会话可能运行在其他 Pod，本地查不到）；
+    # 失败仅告警，不影响本地停止逻辑与返回值
+    try:
+        redis_client = getattr(request.app.state, "redis_client", None)
+        if redis_client is not None:
+            await redis_client.set(f"chat_stop:{session_id}", "1", ex=300)
+    except Exception:
+        logger.warning("[chat] 写入 Redis 停止标志失败", exc_info=True)
+
     chat_tasks = getattr(request.app.state, "chat_tasks", {})
     cancel_event = chat_tasks.get(session_id)
     if cancel_event is None:

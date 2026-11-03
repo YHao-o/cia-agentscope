@@ -30,15 +30,27 @@ def filter_allowed(paths: list[str]) -> list[str]:
 
 
 def diff(
-    before: set[str], after: set[str], exclude_prefixes: tuple[str, ...] = ()
+    before: set[str] | dict[str, tuple[str, str]],
+    after: set[str] | dict[str, tuple[str, str]],
+    exclude_prefixes: tuple[str, ...] = (),
 ) -> list[str]:
-    """返回 after - before 的新相对路径列表，按路径字符串升序排序。
+    """返回本轮"新增或内容变化"的相对路径列表，按路径字符串升序排序。
+
+    快照支持两种形态：
+    - set[str]：纯路径集合，只识别新增路径（旧行为）
+    - dict[str, (mtime, size)]：带修改签名，同路径文件 mtime/size
+      变化（重生成/覆盖）也算本轮产物
 
     exclude_prefixes：排除的相对路径前缀（平台写入目录，非模型产物）。
     如 uploads/——上传文件解析内容由 persist_upload_files_to_workspace
     在 before 快照之后写入沙箱，不排除会被误判为"本轮生成的文件"。
     """
-    added = after - before
+    if isinstance(before, dict) and isinstance(after, dict):
+        added = {p for p, sig in after.items() if before.get(p) != sig}
+    else:
+        # 纯路径集合（或混用形态）：退化为路径差集
+        before_paths = set(before)
+        added = set(after) - before_paths
     if exclude_prefixes:
         added = {p for p in added if not p.startswith(exclude_prefixes)}
     return sorted(added)

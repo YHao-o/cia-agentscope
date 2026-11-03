@@ -16,7 +16,9 @@ CREATE TABLE IF NOT EXISTS sessions (
     latest_trace_id VARCHAR(255),
     is_pinned    TINYINT(1) NOT NULL DEFAULT 0,
     pinned_at    TIMESTAMP NULL,
-    agent_ids    JSON NULL DEFAULT NULL
+    agent_ids    JSON NULL DEFAULT NULL,
+    -- 逻辑删除标记：NULL=活跃；非 NULL=已删除（删除时间）。子表数据保留
+    deleted_at   TIMESTAMP NULL DEFAULT NULL
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
 CREATE INDEX idx_sessions_user_id ON sessions(user_id);
@@ -51,6 +53,8 @@ CREATE TABLE IF NOT EXISTS messages (
     feedback       TINYINT(1) NULL DEFAULT NULL,
     -- 反馈评价内容（点踩后用户填写的文字说明，随 feedback 一同覆盖更新）
     feedback_comment VARCHAR(1024) NULL DEFAULT NULL,
+    -- 逻辑删除标记：NULL=活跃；非 NULL=已删除（删除时间）。物理行保留
+    deleted_at      TIMESTAMP NULL DEFAULT NULL,
     FOREIGN KEY (session_id) REFERENCES sessions(session_id) ON DELETE CASCADE
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
@@ -188,6 +192,9 @@ ALTER TABLE session_files ADD COLUMN (message_pair_id VARCHAR(64) NULL);
 ALTER TABLE upload_files ADD COLUMN (message_pair_id VARCHAR(64) NULL);
 ALTER TABLE message_shares ADD COLUMN (title VARCHAR(255) NOT NULL DEFAULT '');
 ALTER TABLE message_favorites ADD COLUMN (title VARCHAR(255) NOT NULL DEFAULT '');
+-- 逻辑删除标记（存量表升级；重复列报 1060 被下方兼容逻辑忽略）
+ALTER TABLE sessions ADD COLUMN (deleted_at TIMESTAMP NULL DEFAULT NULL);
+ALTER TABLE messages ADD COLUMN (deleted_at TIMESTAMP NULL DEFAULT NULL);
 
 -- 存量回填：按所属会话反查上传者（幂等；会话已删除的孤儿记录保持空串，不误归属）
 UPDATE upload_files uf

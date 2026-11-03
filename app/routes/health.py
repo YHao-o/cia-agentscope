@@ -61,11 +61,11 @@ def _llm_error(status_code: int, err_type: str, message: str,
 
 @router.get("/health/llm")
 async def llm_health(request: Request):
-    """探测大模型服务可用性：向默认模型发送一次最小请求。
+    """探测大模型网关是否存活：带虚构 api_key 发最小请求，401 即存活。
 
-    - 成功：返回 200 及模型回复
-    - 上游返回错误：透传大模型服务的状态码与报错信息
-    - 连接失败 / 超时：分别返回 502 / 504
+    - 网关拒绝虚构鉴权（401）→ 存活，返回 200
+    - 正常回复（200，网关未启用鉴权）→ 存活，返回 200 及模型回复
+    - 其余错误：透传状态码；连接失败 / 超时：502 / 504
     """
     model_config = getattr(request.app.state, "model_config", None) or {}
     model_cfg = (model_config.get("models") or {}).get("default") or {}
@@ -75,7 +75,9 @@ async def llm_health(request: Request):
         return _llm_error(500, "config_error", "模型配置未加载（models.default 缺失）",
                           model_name, base_url)
 
-    client = create_async_client(model_cfg, timeout=LLM_PROBE_TIMEOUT)
+    # 存活探测用虚构 key：不消耗配额，401 即证明网关存活
+    probe_cfg = {**model_cfg, "api_key": "sk-healthcheck-invalid-key"}
+    client = create_async_client(probe_cfg, timeout=LLM_PROBE_TIMEOUT)
     start = time.monotonic()
     try:
         response = await client.chat.completions.create(
@@ -87,7 +89,10 @@ async def llm_health(request: Request):
     except APITimeoutError as e:
         return _llm_error(504, "timeout", str(e), model_name, base_url)
     except APIStatusError as e:
-        # 大模型服务返回的错误状态码（401/429/500 等）原样透传
+        if e.status_code == 401:
+            # 虚构鉴权被拒 → 网关存活
+            return {"status": "ok", "model": model_name, "base_url": base_url}
+        # 其余状态码（403/429/500 等）原样透传
         return _llm_error(e.status_code, type(e).__name__,
                           getattr(e, "message", None) or str(e),
                           model_name, base_url)

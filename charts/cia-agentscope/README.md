@@ -1,263 +1,255 @@
-# cia-agentscope Helm Chart
+# oia-agentscope Helm Chart
 
-该 Chart 只部署 `cia-agentscope` 应用，不创建 MySQL、Redis 或 OpenSandbox。应用默认通过 `ClusterIP` 暴露 `7010` 端口（可切换 `NodePort`），默认单副本。存储支持三种模式：`hostPath`（默认，各节点共同挂载的 SFS 目录）、`pvc`（由 chart 创建 PVC，多副本需 `ReadWriteMany`，如 `nfs-client`）、`existingClaim`（复用已有 PVC），均挂载到容器内 `/data/session-files`。
+AgentScope 智能体服务（OIA-AGENTSCOPE）的**上线部署 Chart**。
 
-## 前置条件
+结构与 OIA-CONFIG 的 `oia-config-local` 完全一致，沿用同一套集群约定（便于两个系统并行运维），
+环境变量则按应用 `.env` 逐项拆解：
 
-- 内网部署机已配置 `kubectl` 和 Helm 3，并可访问目标 Kubernetes 集群；
-- 应用镜像已推送到 `registry.ccdc.cn:5000`；
-- 集群可以解析并访问现有 MySQL、Redis；
-- MySQL 账号可以连接目标库，并具备应用启动时初始化表所需的 DDL/DML 权限；
-- 所有可能调度应用 Pod 的节点都已把同一个 SFS 挂载到 `/app/dify/sfs`；
-- 集群支持 `startupProbe`；
-- 已准备包含 `MYSQL_PASSWORD` 和 `JWT_SECRET` 的 Kubernetes Secret。
+- **api**：FastAPI / AgentScope 后端，容器端口 `7012`，健康检查 `/health`
+- **proxy**：前端由 Nginx 托管，容器端口 `80`，`/api/` 反代到后端 Service
+- **对外暴露**：NodePort（前端 30102 / 后端 30713）
 
-OpenSandbox 不属于本 Chart。部署前保持 `opensandbox.poolSize: 0`，依赖沙箱的功能要等 OpenSandbox 独立部署并配置连接地址后才能使用。
+> 实测兼容性：Kubernetes **1.23.14** / Helm **v3.10.1**（`helm lint` + 多组渲染场景全部通过）。
 
-## 1. 构建和推送应用镜像
+## 1. 目录结构
 
-在包含 Dockerfile 和离线依赖包的项目根目录执行：
-
-```bash
-export APP_IMAGE=registry.ccdc.cn:5000/cia-agentscope:20261013-1
-
-docker build -t "$APP_IMAGE" .
-docker push "$APP_IMAGE"
+```
+deploy/helm/oia-agentscope/
+├── Chart.yaml                 # name: agentscope（release 名建议用 oia-agentscope）
+├── values.yaml                # 默认配置（含集群约定 + 应用 .env 全量变量）
+├── values-prod.yaml           # 生产环境示例
+├── values.schema.json         # 顶层键名校验，防 --set 写错键
+├── .helmignore
+├── README.md
+└── templates/
+    ├── _helpers.tpl           # 命名 / 标签 / PVC 名
+    ├── config.tpl             # nginx.conf + 后端环境变量（多个 define）
+    ├── configmap.yaml         # 前端 nginx.conf（名为 <release>）
+    ├── deployment.yaml        # 前端 Nginx Deployment（名为 <release>）
+    ├── service.yaml           # 前端 Service（名为 <release>-svc）
+    ├── api-config.yaml        # 后端 ConfigMap（名为 <release>-api）
+    ├── api-deployment.yaml    # 后端 Deployment
+    ├── api-svc.yaml           # 后端 Service
+    ├── pvc.yaml               # Nginx 日志 / 后端日志 / 会话文件 三个 PVC（外部技能默认不走 PVC）
+    └── NOTES.txt              # 安装后打印访问地址
 ```
 
-镜像 tag 应使用不可变版本，不建议生产环境使用 `latest`。把实际 tag 同步写入 `examples/values-prod-hostpath.yaml` 或 `examples/values-prod-pvc.yaml` 的 `image.tag`。
+## 2. 资源命名（release = `oia-agentscope`）
 
-values 默认引用命名空间内预建的 `docker-register-secret` 拉取私仓镜像（与 oia-admin chart 一致）。若目标命名空间中的 Secret 名称不同，请替换：
+| 资源 | 名称 | 说明 |
+| --- | --- | --- |
+| Deployment / ConfigMap（前端） | `oia-agentscope` | Nginx |
+| Service（前端） | `oia-agentscope-svc` | NodePort 30102 |
+| Deployment / Service / ConfigMap（后端） | `oia-agentscope-api` | 后端 |
+| PVC（Nginx 日志） | `oia-agentscope` | 5Gi，nfs-client RWX |
+| PVC（后端日志） | `oia-agentscope-api` | 20Gi，nfs-client RWX |
+| PVC（会话文件） | `oia-agentscope-api-session-files` | 20Gi，nfs-client RWX |
+| 外部技能目录 | 宿主机 `/app/dify/sfs/agentscope-external-skills` | hostPath（默认），跨命名空间共享 |
+
+## 3. 端口规划
+
+| 服务 | 容器端口 | Service 端口 | NodePort | 用途 |
+| --- | --- | --- | --- | --- |
+| proxy | 80 | 80 | **30102** | 页面；Nginx 同时反代 `/api`、`/health` |
+| api | 7012 | 7012 | **30713** | API 直连，供其他系统调用 |
+
+> oia-admin 用 30100/30711、oia-config 用 30101/30712，这里顺延用 30102/30713；
+> 如需修改，注意 **nodePort 集群内全局唯一**。
+
+## 4. 环境变量（对应应用 .env）
+
+`templates/config.tpl` 里的 `oia-agentscope.api.config` 把 values 渲染成 `api-config` ConfigMap，
+键名与应用 `.env` 完全对齐（.env 里没出现的变量一律不输出）：
+
+| .env 变量 | values 路径 |
+| --- | --- |
+| `CONFIG_DECRYPT_KEY` | `api.configDecryptKey` |
+| `JWT_SECRET` / `JWT_EXPIRE_HOURS` | `api.jwt.secret` / `api.jwt.expireHours` |
+| `AUTH_MOCK` / `AUTH_API_URL` | `api.auth.mock` / `api.auth.apiUrl` |
+| `REDIS_URL` / `REDIS_SESSION_TTL` | `externalRedis.*`（拼装） / `api.session.redisSessionTtl` |
+| `MYSQL_HOST/PORT/USER/PASSWORD/DATABASE` | `externalMysql.*` |
+| `UPLOAD_MAX_SIZE_MB` / `SESSION_FILES_PERSIST_DIR` | `api.upload.*` |
+| `LANGFUSE_SECRET_KEY/PUBLIC_KEY/BASE_URL` | `langfuse.*` |
+| `LOG_LEVEL/DIR/MAX_BYTES/BACKUP_COUNT` | `api.log.*` |
+| `MNG_AUTH_URL` / `MNG_INTENT_URL` | `api.mng.*` |
+| `EXTERNAL_SKILLS_DIR` | `api.skills.externalDir` |
+| `OPENSANDBOX_*` / `WORKSPACE_TTL` | `api.opensandbox.*` |
+| `REGULATIONS_*` / `POLICY_QA_KB_MAP` | `api.regulations.*` |
+| `MINERU_API_KEY` / `MINERU_BASE_URL` | `api.mineru.*` |
+| `SENSITIVE_*` | `api.sensitive.*` |
+| `BOCHA_API_BASE` / `BOCHA_API_KEY` | `api.bocha.*` |
+
+两处需要按环境确认（默认值已按集群改写，与 .env 的本地值不同）：
+
+- `externalMysql`：.env 是 `localhost:3307` / `root`，集群里改成 `25.51.200.24:15001`，
+  库名沿用 `agentscope`（需提前建库）。若该实例不允许 root 远程连接，换账号密码。
+- `externalRedis`：.env 是 `redis://localhost:6379/0`，集群里拼成
+  `redis://:****@redis.redis.svc.cluster.local:6379/0`。
+- `api.regulations.kb.baseUrl`：.env 是 `http://localhost:6183`，集群里需改成 policy-kb-api 的实际 Service 地址。
+
+`ENC(...)` 形式的 `JWT_SECRET` / `MYSQL_PASSWORD` 由应用用 `CONFIG_DECRYPT_KEY` 运行时解密，
+所以 values 里保持 .env 原值即可；换环境时三者要一起重新生成。
+
+## 5. 部署
+
+### 5.1 构建并推送镜像
+
+```bash
+docker build -t registry.ccdc.cn:5000/oia/oia-agentscope-backend:1.0.0 .
+docker push registry.ccdc.cn:5000/oia/oia-agentscope-backend:1.0.0
+
+docker build -t registry.ccdc.cn:5000/oia/oia-agentscope-frontend:1.0.0 .
+docker push registry.ccdc.cn:5000/oia/oia-agentscope-frontend:1.0.0
+```
+
+> 若只部署后端（无前端镜像），加 `--set proxy.enabled=false`。
+
+### 5.2 准备命名空间与拉取密钥
+
+```bash
+kubectl create namespace oia
+
+# 集群约定的拉取密钥名称：docker-register-secret
+kubectl -n oia create secret docker-registry docker-register-secret \
+  --docker-server=registry.ccdc.cn:5000 \
+  --docker-username=<user> --docker-password=<pwd>
+```
+
+### 5.3 安装 / 升级
+
+```bash
+# 默认（values.yaml 中已固化集群约定）
+helm upgrade --install oia-agentscope ./deploy/helm/oia-agentscope -n oia
+
+# 生产（敏感项走 Secret）
+kubectl -n oia create secret generic oia-agentscope-secret \
+  --from-literal=CONFIG_DECRYPT_KEY='<加密主密钥>' \
+  --from-literal=JWT_SECRET='ENC(...)' \
+  --from-literal=MYSQL_PASSWORD='ENC(...)' \
+  --from-literal=REDIS_URL='redis://:password@host:6379/0' \
+  --from-literal=LANGFUSE_PUBLIC_KEY='pk-lf-xxx' \
+  --from-literal=LANGFUSE_SECRET_KEY='sk-lf-xxx' \
+  --from-literal=OPENSANDBOX_API_KEY='<沙箱密钥>' \
+  --from-literal=MINERU_API_KEY='<MinerU 密钥>' \
+  --from-literal=BOCHA_API_KEY='<博查密钥>'
+
+helm upgrade --install oia-agentscope ./deploy/helm/oia-agentscope \
+  -n oia -f ./deploy/helm/oia-agentscope/values-prod.yaml
+```
+
+其他命令：
+
+```bash
+helm lint ./deploy/helm/oia-agentscope                  # 语法检查
+helm template oia-agentscope ./deploy/helm/oia-agentscope   # 本地渲染预览
+helm -n oia uninstall oia-agentscope
+```
+
+## 6. 关键设计
+
+### 6.1 nginx.conf 整体挂载
+
+Chart 生成的**完整 nginx.conf** 挂载到 `/etc/nginx/nginx.conf`（`subPath: nginx.conf`），
+而不是 conf.d 片段 —— 因为配置含 `worker_processes` / `events`，这两个指令只在 main 上下文合法。
+
+生成的主配置**不包含** `include /etc/nginx/conf.d/*.conf;`，因此镜像内置的 `default.conf`
+不会被加载，不会出现端口冲突；`/api/` 的上游由模板动态拼成 `<release>-api:7012`。
+
+### 6.2 敏感项注入
+
+设置 `api.existingSecret` 后，`api.existingSecretKeys` 里**非空**的键对应的变量不再写入
+ConfigMap，改为 `secretKeyRef` 注入：
+
+`CONFIG_DECRYPT_KEY` / `JWT_SECRET` / `MYSQL_PASSWORD` / `REDIS_URL` /
+`LANGFUSE_PUBLIC_KEY` / `LANGFUSE_SECRET_KEY` / `OPENSANDBOX_API_KEY` /
+`REGULATIONS_KB_INTERNAL_TOKEN` / `REGULATIONS_LANGFUSE_PUBLIC_KEY` /
+`REGULATIONS_LANGFUSE_SECRET_KEY` / `MINERU_API_KEY` / `BOCHA_API_KEY`
+
+对应值留空即不注入该项（Secret 里没这个键时很有用），此时变量仍按明文写进 ConfigMap。
+判断逻辑集中在 `config.tpl` 的 `oia-agentscope.api.env` 与 `api-deployment.yaml` 的
+`$secretMap`，两处共用同一套键名，改的时候要同步。
+
+### 6.3 数据库与 Redis
+
+- MySQL：由 `externalMysql.*` 渲染成 `MYSQL_HOST/PORT/USER/PASSWORD/DATABASE`（本项目不用 `DATABASE_URL`）。
+- Redis：由 `externalRedis.*` 拼装成 `REDIS_URL`，密码经 `urlquery` 转义
+  （`Welcome!23$%` → `Welcome%2123%24%25`），不会被 `#`、`@`、`%` 截断；
+  也可直接给 `externalRedis.url` 覆盖整串。
+
+### 6.4 健康探针
+
+| 组件 | 路径 | 说明 |
+| --- | --- | --- |
+| api | `/health` | 后端自带，无需鉴权 |
+| proxy | `/nginx-healthz` | Nginx 自身返回 200，不依赖后端 |
+
+后端默认开启 `startupProbe`（5s × 60 次容错），避免首次启动建表/拉镜像耗时被杀。
+
+### 6.5 持久化
+
+三个目录都需要多副本共享，默认 `nfs-client` + `ReadWriteMany`，并带
+`helm.sh/resource-policy: keep`（卸载 release 时保留数据）：
+
+| values 路径 | 挂载点 | 对应变量 |
+| --- | --- | --- |
+| `api.persistence.logs` | `/app/logs` | `LOG_DIR` |
+| `api.persistence.sessionFiles` | `/app/data/session_files` | `SESSION_FILES_PERSIST_DIR` |
+| `api.persistence.externalSkills` | `/app/external_skills` | `EXTERNAL_SKILLS_DIR` |
+
+**外部技能目录默认不用 PVC**，而是直接挂载宿主机上的 SFS 目录：
 
 ```yaml
-imagePullSecrets:
-  - name: docker-register-secret
+api:
+  persistence:
+    externalSkills:
+      enabled: true
+      type: hostPath          # hostPath（默认）| pvc
+      mountPath: "/app/external_skills"
+      hostPath:
+        path: "/app/dify/sfs"
+        type: DirectoryOrCreate   # 目录不存在会自动创建
+        subPath: "agentscope-external-skills"
 ```
 
-本地开发或无需认证的仓库可置空 `imagePullSecrets: []`。
+原因：**一个 PV 只能被一个 PVC 绑定**，`pvc` 方案无法让其它命名空间的服务读写同一份技能文件；
+hostPath 则由各命名空间的 Pod 各自挂载同一个宿主机目录，天然共享。
 
-## 2. 检查每个节点的 SFS
+> 前置条件：Pod 可调度到的节点上都已挂载该 SFS（当前 `nodeSelector group: dify` 的节点组）。
+> 挂载点缺失时 Pod 会一直 `ContainerCreating`，`kubectl describe` 里可见
+> `hostPath type check failed` 或 `no such file or directory`。
 
-在每个可能调度应用的 Kubernetes 节点执行：
+## 7. 与 `oia-config-local` 的差异
+
+| 维度 | oia-config-local | oia-agentscope（本 Chart） |
+| --- | --- | --- |
+| 应用变量 | APP_NAME / SECRET_KEY / DATABASE_URL / SKILLS_DIR 等 | 按应用 .env：CONFIG_DECRYPT_KEY / JWT_* / MYSQL_* / OPENSANDBOX_* / REGULATIONS_* 等 |
+| 数据库注入 | `DATABASE_URL` 单串 | `MYSQL_HOST/PORT/USER/PASSWORD/DATABASE` 分段 |
+| Redis 注入 | `REDIS_HOST/PORT/DB/PASSWORD` | `REDIS_URL` 单串 |
+| 持久化 | 日志 PVC + 技能目录 | 日志 / 会话文件 两个 PVC + 外部技能目录 |
+| NodePort | 前端 30101 / 后端 30712 | 前端 30102 / 后端 30713 |
+
+其余（镜像仓库、拉取密钥、nodeSelector、存储类、nginx 反代、探针、Secret 注入方式）完全一致。
+
+## 8. 故障排查
 
 ```bash
-mountpoint /app/dify/sfs
-findmnt -T /app/dify/sfs -o SOURCE,FSTYPE,TARGET,OPTIONS
-stat -c '%U:%G %a %n' /app/dify/sfs
+kubectl -n oia get pods,svc,pvc -l app.kubernetes.io/instance=oia-agentscope
+kubectl -n oia logs -l app.kubernetes.io/instance=oia-agentscope,component=api --tail=200
+kubectl -n oia get cm oia-agentscope-api -o yaml | head -60
+
+NODE_IP=<节点IP>
+curl http://$NODE_IP:30102            # 页面
+curl http://$NODE_IP:30713/health     # 后端健康
 ```
 
-确认：
+常见问题：
 
-- `mountpoint` 返回成功；
-- 每个节点看到的 `SOURCE` 和文件系统类型一致；
-- 目录不是节点本地的空目录；
-- 实际应用镜像用户对目录有读写权限。
-
-跨节点验证可以在节点 A 创建唯一标记文件，然后立即从其他节点读取同一文件：
-
-```bash
-marker=".cia-agentscope-sfs-check-$(date +%s)-$(hostname)"
-printf '%s\n' "$(hostname)" > "/app/dify/sfs/$marker"
-echo "$marker"
-```
-
-在其他节点执行 `cat /app/dify/sfs/<marker>`。所有节点都能读到后删除标记文件。若只有部分节点通过检查，应给这些节点增加标签，并在 values 的 `nodeSelector` 中限制调度。
-
-当前 Dockerfile 没有声明非 root 用户。后续镜像改为固定 UID/GID 时，必须重新验证该 UID/GID 对 SFS 的写权限，并在 values 中显式启用 `runAsNonRoot`。
-
-## 3. 准备命名空间和 Secret
-
-先创建命名空间：
-
-```bash
-kubectl create namespace cia-agentscope --dry-run=client -o yaml | kubectl apply -f -
-```
-
-推荐把敏感值分别保存为权限受控的临时文件，再创建 Secret，避免把真实凭证写入 values：
-
-```bash
-kubectl -n cia-agentscope create secret generic cia-agentscope-secrets \
-  --from-file=MYSQL_PASSWORD=/secure/path/mysql-password \
-  --from-file=JWT_SECRET=/secure/path/jwt-secret \
-  --from-file=CONFIG_ENCRYPTION_KEY=/secure/path/config-encryption-key \
-  --dry-run=client -o yaml | kubectl apply -f -
-```
-
-`CONFIG_ENCRYPTION_KEY` 仅在配置中使用 `ENC(...)` 密文时需要。OpenSandbox 部署后，可向同一个 Secret 增加 `OPENSANDBOX_API_KEY`。不要把 Secret YAML、密码或密钥提交到 Git。
-
-默认 Secret key 映射如下，可通过 values 的 `existingSecret.keys` 修改：
-
-```text
-MYSQL_PASSWORD
-JWT_SECRET
-CONFIG_ENCRYPTION_KEY
-OPENSANDBOX_API_KEY
-```
-
-## 4. 修改生产 values
-
-复制示例文件后修改：
-
-```bash
-cp examples/values-prod-hostpath.yaml values-prod.yaml
-```
-
-至少检查：
-
-- `image.tag`：已推送的应用镜像 tag；
-- `imagePullSecrets`：默认 `docker-register-secret`，按命名空间实际 Secret 调整；
-- `externalMysql.host/port/user/database`；
-- `externalRedis.url`；
-- `existingSecret.name`；
-- `storage.type`：`hostPath`（默认，需 `storage.hostPath: /app/dify/sfs`）、`pvc`（chart 创建 PVC，见下）或 `existingClaim`；
-- `storage.mountPath: /data/session-files`；
-- `service.type/nodePort`：需要节点端口直接访问时改为 `NodePort` 并可选填固定 `nodePort`；
-- `nodeSelector`：仅部分节点验证通过 SFS 时填写；
-- `resources`：结合压测结果调整。
-
-默认 `replicaCount: 1`。当前应用仍有进程内的取消标志、反馈状态和后台任务，尚未完成多副本状态外置，不要直接扩容。
-
-## 5. 在内网校验 Chart
-
-从 Chart 源目录校验：
-
-```bash
-helm lint ./cia-agentscope -f ./cia-agentscope/examples/values-prod-hostpath.yaml --strict
-
-helm template cia-agentscope ./cia-agentscope \
-  -n cia-agentscope \
-  -f ./cia-agentscope/examples/values-prod-hostpath.yaml \
-  > /tmp/cia-agentscope-rendered.yaml
-```
-
-重点确认：
-
-```bash
-grep -nE 'kind: Deployment|kind: Service|type: ClusterIP|/app/dify/sfs|/data/session-files' /tmp/cia-agentscope-rendered.yaml
-
-if grep -nE 'docker.io|quay.io|ghcr.io|kind: Secret|MYSQL_PASSWORD:|JWT_SECRET:' /tmp/cia-agentscope-rendered.yaml; then
-  echo 'ERROR: 渲染结果包含公共镜像仓库或明文敏感信息' >&2
-  exit 1
-fi
-```
-
-如果内网已有 `kubeconform`，可进一步执行 Kubernetes Schema 校验：
-
-```bash
-kubeconform -strict -summary /tmp/cia-agentscope-rendered.yaml
-```
-
-## 6. 安装
-
-使用 Chart 源目录：
-
-```bash
-helm upgrade --install cia-agentscope ./cia-agentscope \
-  --namespace cia-agentscope \
-  --create-namespace \
-  --values ./values-prod.yaml \
-  --atomic \
-  --timeout 10m
-```
-
-使用离线 `.tgz` 包：
-
-```bash
-sha256sum -c cia-agentscope-0.1.0.tgz.sha256
-helm show chart cia-agentscope-0.1.0.tgz
-
-helm upgrade --install cia-agentscope ./cia-agentscope-0.1.0.tgz \
-  --namespace cia-agentscope \
-  --create-namespace \
-  --values ./values-prod.yaml \
-  --atomic \
-  --timeout 10m
-```
-
-## 7. 部署后检查
-
-```bash
-kubectl -n cia-agentscope get deployment,pod,service
-kubectl -n cia-agentscope rollout status deployment/cia-agentscope --timeout=10m
-kubectl -n cia-agentscope logs deployment/cia-agentscope --tail=200
-
-kubectl -n cia-agentscope port-forward service/cia-agentscope 7010:7010
-curl http://127.0.0.1:7010/health
-```
-
-如果 Release 名不是 `cia-agentscope`，资源名可能带有 Release 前缀，请以 `helm status` 和 `kubectl get` 输出为准。
-
-应用启动时会连接 MySQL 并初始化表。`/health` 成功只表示应用进程和基础初始化已完成，不代表尚未部署的 OpenSandbox 功能可用。
-
-## 8. 升级与回滚
-
-推送新镜像并更新 `values-prod.yaml` 的 `image.tag` 后执行：
-
-```bash
-helm upgrade cia-agentscope ./cia-agentscope-0.1.0.tgz \
-  --namespace cia-agentscope \
-  --values ./values-prod.yaml \
-  --atomic \
-  --timeout 10m
-```
-
-查看历史和回滚：
-
-```bash
-helm -n cia-agentscope history cia-agentscope
-helm -n cia-agentscope rollback cia-agentscope <REVISION> --wait --timeout 10m
-```
-
-滚动升级会终止旧 Pod 上仍在进行的 SSE 连接；客户端应支持断线重连。`terminationGracePeriodSeconds` 默认 60 秒，可根据实际长任务调整。
-
-## 9. OpenSandbox 后续接入
-
-OpenSandbox 独立部署完成后，更新 values：
-
-```yaml
-opensandbox:
-  domain: opensandbox-server.opensandbox.svc.cluster.local:8080
-  protocol: http
-  poolSize: 0
-```
-
-如启用了 API Key，同时在已有 Secret 中加入 `OPENSANDBOX_API_KEY`，然后执行 `helm upgrade`。本 Chart 不包含 OpenSandbox CRD、Controller、Server 或 RBAC。
-
-## 10. 存储模式：PVC 与已有 PVC
-
-集群提供 StorageClass 时，可让 chart 自动创建 PVC（参考 `examples/values-prod-pvc.yaml`）：
-
-```yaml
-storage:
-  type: pvc
-  mountPath: /data/session-files
-  pvc:
-    storageClass: nfs-client
-    accessModes: ReadWriteMany   # 多副本共享必须 ReadWriteMany
-    size: 50Gi
-    # subPath: ""                # 可选，多个 release 共用一个 PVC 时隔离目录
-```
-
-- PVC 名称与 release fullname 一致，默认带 `helm.sh/resource-policy: keep` 注解，`helm uninstall` 不会删除数据卷；
-- `storageClass: "-"` 表示显式禁用动态供给，留空使用集群默认 StorageClass；
-- PVC 模式不会渲染 hostPath。
-
-复用已存在的 PVC 时改为：
-
-```yaml
-storage:
-  type: existingClaim
-  existingClaim: cia-agentscope-shared-files
-  mountPath: /data/session-files
-```
-
-## 常见排查
-
-- `ImagePullBackOff`：检查镜像 tag、仓库连通性和 `imagePullSecrets`；
-- `CreateContainerConfigError`：检查 `existingSecret.name` 及 Secret key 名；
-- `FailedMount`：逐节点检查 `/app/dify/sfs` 是否存在并已挂载，Chart 使用 `Directory`，不会自动创建本地目录；
-- Pod 启动失败且日志显示 MySQL 错误：检查 DNS、端口、账号、密码、库名和建表权限；
-- Redis 错误：检查 `externalRedis.url`、网络策略和 Redis ACL；
-- readiness/liveness 失败：查看应用日志以及 `/health` 响应；
-- Pod 一直 Pending：检查资源 requests、nodeSelector、污点容忍和节点 SFS 标签；
-- 沙箱相关接口失败：OpenSandbox 尚未部署或 `opensandbox.domain/API Key` 配置不正确。
+- `ImagePullBackOff` → `docker-register-secret` 未创建或镜像 tag 不存在。
+- `provided port is already allocated` → nodePort 与集群内其他 Service 冲突，换端口或置空自动分配。
+- Nginx `host not found in upstream` → 后端 Service 未创建（检查 `api.enabled`）。
+- 页面可开但接口 502 → 后端 Pod 未 Ready，检查 MySQL / Redis 连通性。
+- 后端起不来并报解密失败 → `CONFIG_DECRYPT_KEY` 与 `ENC(...)` 的 `JWT_SECRET` / `MYSQL_PASSWORD` 不是同一套。
+- 会话文件重启后丢失 → 确认 `api.persistence.sessionFiles.enabled=true`，且
+  `SESSION_FILES_PERSIST_DIR` 与挂载点一致。
+- Pod 卡在 `ContainerCreating` → `kubectl describe pod` 看 Events，多为宿主机 SFS 目录不存在
+  或未挂载（对照 6.5 的前置条件）。

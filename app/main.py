@@ -56,6 +56,15 @@ async def lifespan(app: FastAPI):
     model_config = load_model_config(MODEL_CONFIG_PATH)
     app.state.model_config = model_config
 
+    # ---- Redis（多副本共享沙箱映射，保留用于其他需求） ----
+    # 需在 workspace_manager 之前初始化：manager 依赖它做用户→沙箱映射共享
+    redis_client = aioredis.from_url(
+        REDIS_URL,
+        decode_responses=False,
+    )
+    app.state.redis_client = redis_client
+    logger.info("Redis client initialized (%s)", REDIS_URL)
+
     # ---- 工作区管理器（OpenSandbox，唯一后端） ----
     from datetime import timedelta
     from opensandbox.config import ConnectionConfig
@@ -77,6 +86,7 @@ async def lifespan(app: FastAPI):
         ready_timeout=timedelta(seconds=120),
         pool_size=OPENSANDBOX_POOL_SIZE,
         pool_refill=OPENSANDBOX_POOL_REFILL,
+        redis_client=redis_client,
     )
     logger.info(
         "Workspace manager initialized [opensandbox] "
@@ -92,14 +102,6 @@ async def lifespan(app: FastAPI):
         model_config, workspace_manager
     )
     logger.info("Orchestrator service initialized (multi-agent + multi-intent)")
-
-    # ---- Redis（保留，用于其他需求） ----
-    redis_client = aioredis.from_url(
-        REDIS_URL,
-        decode_responses=False,
-    )
-    app.state.redis_client = redis_client
-    logger.info("Redis client initialized (%s)", REDIS_URL)
 
     # ---- MySQL 连接池（会话持久化） ----
     mysql_pool = await aiomysql.create_pool(

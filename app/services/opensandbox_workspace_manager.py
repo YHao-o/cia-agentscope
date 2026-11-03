@@ -14,6 +14,7 @@
 import asyncio
 import logging
 import os
+import socket
 import time
 from datetime import timedelta
 from typing import Optional
@@ -36,6 +37,11 @@ _MAX_CREATE_RETRIES = 3          # 创建沙箱最大重试次数
 _RETRY_BASE_DELAY = 2.0          # 重试基础延迟（秒），指数退避
 _DEGRADE_THRESHOLD = 5           # 连续失败 N 次后进入降级状态
 _DEGRADE_RECOVERY_TIME = 60.0    # 降级后恢复探测间隔（秒）
+
+# ---- 多副本分布式锁配置（Redis） ----
+_DIST_LOCK_TTL = 30              # 新建沙箱分布式锁 TTL（秒）
+_DIST_LOCK_WAIT_TIMEOUT = 30.0   # 等待分布式锁总超时（秒）
+_DIST_LOCK_POLL_INTERVAL = 0.5   # 等锁轮询间隔（秒）
 
 
 class _Entry:
@@ -76,6 +82,7 @@ class OpenSandboxWorkspaceManager:
         ready_timeout: timedelta = timedelta(seconds=120),
         pool_size: int = 0,
         pool_refill: bool = True,
+        redis_client=None,
     ):
         self._config = connection_config
         self._base_image = base_image
@@ -83,6 +90,8 @@ class OpenSandboxWorkspaceManager:
         self._ttl = ttl
         self._resource = resource or {"cpu": "100m", "memory": "128Mi"}
         self._ready_timeout = ready_timeout
+        # 多副本：Redis 客户端（None 时退化为单进程内存映射行为）
+        self._redis = redis_client
         self._cache: dict[str, _Entry] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self._struct_lock = asyncio.Lock()
@@ -117,6 +126,75 @@ class OpenSandboxWorkspaceManager:
                 lock = asyncio.Lock()
                 self._locks[wid] = lock
             return lock
+
+    # ---- 多副本：Redis 用户→沙箱映射 / 分布式锁 ----
+    # 所有方法绝不抛异常：Redis 未配置/异常时返回 None/False，退化为单进程行为。
+    async def _redis_get_map(self, wid: str) -> Optional[str]:
+        """读取 wid → sandbox_id 映射；无映射/异常返回 None。"""
+        if self._redis is None:
+            return None
+        try:
+            value = await self._redis.get(f"sandbox_map:{wid}")
+            if value is None:
+                return None
+            if isinstance(value, bytes):
+                return value.decode("utf-8")
+            return str(value)
+        except Exception as e:
+            logger.warning(f"[opensandbox_ws] Redis 读取映射失败 wid={wid} error={e}")
+            return None
+
+    async def _redis_set_map(self, wid: str, sandbox_id: str) -> bool:
+        """写入 wid → sandbox_id 映射并刷新 TTL（与沙箱 TTL 一致）；失败返回 False。"""
+        if self._redis is None:
+            return False
+        try:
+            await self._redis.set(
+                f"sandbox_map:{wid}", sandbox_id, ex=int(self._ttl)
+            )
+            return True
+        except Exception as e:
+            logger.warning(
+                f"[opensandbox_ws] Redis 写入映射失败 wid={wid} "
+                f"sandbox_id={sandbox_id} error={e}"
+            )
+            return False
+
+    async def _redis_del_map(self, wid: str) -> bool:
+        """删除 wid → sandbox_id 映射；失败返回 False。"""
+        if self._redis is None:
+            return False
+        try:
+            await self._redis.delete(f"sandbox_map:{wid}")
+            return True
+        except Exception as e:
+            logger.warning(f"[opensandbox_ws] Redis 删除映射失败 wid={wid} error={e}")
+            return False
+
+    async def _redis_acquire_lock(self, wid: str, token: str) -> Optional[bool]:
+        """尝试获取新建沙箱分布式锁（SET NX EX）。
+
+        返回 True=拿到锁，False=被其他 Pod 持有，None=Redis 异常。
+        """
+        if self._redis is None:
+            return None
+        try:
+            ok = await self._redis.set(
+                f"sandbox_lock:{wid}", token, ex=_DIST_LOCK_TTL, nx=True
+            )
+            return bool(ok)
+        except Exception as e:
+            logger.warning(f"[opensandbox_ws] Redis 获取锁失败 wid={wid} error={e}")
+            return None
+
+    async def _redis_release_lock(self, wid: str) -> None:
+        """释放新建沙箱分布式锁（简单 DEL）。"""
+        if self._redis is None:
+            return
+        try:
+            await self._redis.delete(f"sandbox_lock:{wid}")
+        except Exception as e:
+            logger.warning(f"[opensandbox_ws] Redis 释放锁失败 wid={wid} error={e}")
 
     # ---- 高可用：降级检查 ----
     def _check_degraded(self) -> bool:
@@ -302,12 +380,84 @@ class OpenSandboxWorkspaceManager:
                     )
                 else:
                     logger.exception(f"[opensandbox_ws] 销毁沙箱失败 wid={wid}")
+            # 多副本：同步删除 Redis 映射，避免其他 Pod connect 到已销毁沙箱
+            await self._redis_del_map(wid)
             logger.info(f"[opensandbox_ws] 淘汰工作区 wid={wid}")
 
     async def _evict(self, wid: str) -> None:
         lock = await self._get_lock(wid)
         async with lock:
             await self._evict_locked(wid)
+
+    async def _reuse_local_entry(self, wid: str, session_id: str) -> Optional[Sandbox]:
+        """复用本地 cache 中存活的沙箱（原 create_workspace 复用逻辑）。
+
+        不存在/过期/已崩溃 → 返回 None，调用方继续走 Redis 或新建；
+        复用成功会刷新 Redis 映射 TTL（多副本下保持映射不过期）。
+        """
+        entry = self._cache.get(wid)
+        if entry is None:
+            return None
+        if (time.monotonic() - entry.last_access) > self._ttl:
+            return None
+        # 高可用：探测沙箱存活
+        if not await self._touch_session_dir(entry.sandbox, session_id):
+            logger.warning(f"[opensandbox_ws] 沙箱已崩溃，重建 wid={wid}")
+            await self._evict_locked(wid)
+            return None
+        entry.last_access = time.monotonic()
+        session_dir = self._session_dir(session_id)
+        entry.session_ids.add(session_id)
+        entry.workdir = session_dir
+        # 在 Sandbox 对象上设置 workdir，兼容 AgentRegistry 的 system_prompt 构建
+        entry.sandbox.workdir = session_dir
+        # 多副本：复用成功刷新 Redis 映射 TTL
+        await self._redis_set_map(wid, entry.sandbox.id)
+        logger.info(f"[opensandbox_ws] 复用沙箱 wid={wid} session={session_id}")
+        return entry.sandbox
+
+    async def _connect_from_redis(
+        self, wid: str, user_id: str, session_id: str
+    ) -> Optional[Sandbox]:
+        """查 Redis 用户→沙箱映射，跨 Pod connect 复用其他 Pod 创建的沙箱。
+
+        无映射/connect 失败/沙箱已死 → 删映射并返回 None（调用方走新建）；
+        connect 成功 → _touch_session_dir 探活并建会话目录，
+        构造 _Entry 放入本地 cache，刷新 Redis TTL 后返回。
+        """
+        sandbox_id = await self._redis_get_map(wid)
+        if not sandbox_id:
+            return None
+        try:
+            sbx = await Sandbox.connect(sandbox_id, connection_config=self._config)
+        except Exception as e:
+            logger.warning(
+                f"[opensandbox_ws] 跨 Pod 连接沙箱失败，删除映射 wid={wid} "
+                f"sandbox_id={sandbox_id} error={e}"
+            )
+            await self._redis_del_map(wid)
+            return None
+        # 连接成功后探活（顺带建会话目录）
+        if not await self._touch_session_dir(sbx, session_id):
+            logger.warning(
+                f"[opensandbox_ws] 跨 Pod 沙箱已死亡，删除映射 wid={wid} "
+                f"sandbox_id={sandbox_id}"
+            )
+            await self._redis_del_map(wid)
+            return None
+        session_dir = self._session_dir(session_id)
+        new_entry = _Entry(sbx, user_id, session_ids={session_id})
+        new_entry.workdir = session_dir
+        # 在 Sandbox 对象上设置 workdir，兼容 AgentRegistry 的 system_prompt 构建
+        sbx.workdir = session_dir
+        self._cache[wid] = new_entry
+        # 多副本：复用成功刷新 Redis 映射 TTL
+        await self._redis_set_map(wid, sbx.id)
+        logger.info(
+            f"[opensandbox_ws] 跨 Pod 复用沙箱 wid={wid} sandbox_id={sandbox_id} "
+            f"session={session_id}"
+        )
+        return sbx
 
     async def create_workspace(
         self, user_id: str, session_id: str, skill_dirs: list[str] | None = None,
@@ -327,57 +477,106 @@ class OpenSandboxWorkspaceManager:
         wid = self._workspace_id(user_id)
         lock = await self._get_lock(wid)
         async with lock:
-            # 复用已有沙箱
-            entry = self._cache.get(wid)
-            if entry is not None and (time.monotonic() - entry.last_access) <= self._ttl:
-                # 高可用：探测沙箱存活
-                if not await self._touch_session_dir(entry.sandbox, session_id):
-                    logger.warning(
-                        f"[opensandbox_ws] 沙箱已崩溃，重建 wid={wid}"
-                    )
-                    await self._evict_locked(wid)
+            # 1. 复用本地已有沙箱
+            sbx = await self._reuse_local_entry(wid, session_id)
+            if sbx is not None:
+                return sbx
+
+            # 2. 多副本：本地未命中，查 Redis 映射跨 Pod 复用
+            sbx = await self._connect_from_redis(wid, user_id, session_id)
+            if sbx is not None:
+                return sbx
+
+            # 3. 分布式锁内新建（Redis 未配置/异常时退化为直接新建）
+            dist_locked = False
+            try:
+                if self._redis is not None:
+                    lock_token = f"{socket.gethostname()}:{os.getpid()}"
+                    acquired = await self._redis_acquire_lock(wid, lock_token)
+                    if acquired is None:
+                        logger.warning(
+                            f"[opensandbox_ws] Redis 锁获取异常，降级为无锁新建 wid={wid}"
+                        )
+                    elif acquired:
+                        dist_locked = True
+                    else:
+                        # 锁被其他 Pod 持有：轮询等待对方建好后复用，或等到锁
+                        deadline = time.monotonic() + _DIST_LOCK_WAIT_TIMEOUT
+                        while time.monotonic() < deadline:
+                            await asyncio.sleep(_DIST_LOCK_POLL_INTERVAL)
+                            # 重查本地 cache（其他协程可能已建好）
+                            reused = await self._reuse_local_entry(wid, session_id)
+                            if reused is not None:
+                                return reused
+                            # 重查 Redis 映射（其他 Pod 可能已建好）
+                            reused = await self._connect_from_redis(
+                                wid, user_id, session_id
+                            )
+                            if reused is not None:
+                                return reused
+                            acquired = await self._redis_acquire_lock(wid, lock_token)
+                            if acquired is True:
+                                dist_locked = True
+                                break
+                            if acquired is None:
+                                logger.warning(
+                                    f"[opensandbox_ws] Redis 锁等待中异常，"
+                                    f"降级为无锁新建 wid={wid}"
+                                )
+                                break
+                        else:
+                            logger.warning(
+                                f"[opensandbox_ws] 分布式锁等待超时 "
+                                f"{_DIST_LOCK_WAIT_TIMEOUT}s wid={wid}，降级为无锁新建"
+                            )
+                    if dist_locked:
+                        # 拿到锁后 double-check：其他 Pod 可能刚好建完并释放了锁
+                        reused = await self._reuse_local_entry(wid, session_id)
+                        if reused is not None:
+                            return reused
+                        reused = await self._connect_from_redis(
+                            wid, user_id, session_id
+                        )
+                        if reused is not None:
+                            return reused
+
+                # 创建新沙箱（带重试）
+                if langfuse_service:
+                    with langfuse_service.start_span(
+                        "workspace-initialize",
+                        input={"user_id": user_id, "session_id": session_id},
+                    ) as init_span:
+                        sbx = await self._create_sandbox_with_retry()
+                        if init_span:
+                            try:
+                                init_span.update(output={"sandbox_id": sbx.id})
+                            except Exception:
+                                pass
                 else:
-                    entry.last_access = time.monotonic()
-                    session_dir = self._session_dir(session_id)
-                    entry.session_ids.add(session_id)
-                    entry.workdir = session_dir
-                    # 在 Sandbox 对象上设置 workdir，兼容 AgentRegistry 的 system_prompt 构建
-                    entry.sandbox.workdir = session_dir
-                    logger.info(f"[opensandbox_ws] 复用沙箱 wid={wid} session={session_id}")
-                    return entry.sandbox
-
-            # 创建新沙箱（带重试）
-            if langfuse_service:
-                with langfuse_service.start_span(
-                    "workspace-initialize",
-                    input={"user_id": user_id, "session_id": session_id},
-                ) as init_span:
                     sbx = await self._create_sandbox_with_retry()
-                    if init_span:
-                        try:
-                            init_span.update(output={"sandbox_id": sbx.id})
-                        except Exception:
-                            pass
-            else:
-                sbx = await self._create_sandbox_with_retry()
-            session_dir = self._session_dir(session_id)
-            if not await self._touch_session_dir(sbx, session_id):
-                logger.warning(
-                    f"[opensandbox_ws] 新建沙箱后会话目录准备失败 sandbox_id={sbx.id}"
+                session_dir = self._session_dir(session_id)
+                if not await self._touch_session_dir(sbx, session_id):
+                    logger.warning(
+                        f"[opensandbox_ws] 新建沙箱后会话目录准备失败 sandbox_id={sbx.id}"
+                    )
+
+                # 注入技能文件（将宿主技能目录内容写入沙箱）
+                if skill_dirs:
+                    await self._inject_skills(sbx, skill_dirs)
+
+                new_entry = _Entry(sbx, user_id, session_ids={session_id})
+                new_entry.workdir = session_dir
+                self._cache[wid] = new_entry
+                # 多副本：写入 Redis 映射，供其他 Pod connect 复用
+                await self._redis_set_map(wid, sbx.id)
+                logger.info(
+                    f"[opensandbox_ws] 创建沙箱 wid={wid} sandbox_id={sbx.id} "
+                    f"active_sandboxes={len(self._cache)}"
                 )
-
-            # 注入技能文件（将宿主技能目录内容写入沙箱）
-            if skill_dirs:
-                await self._inject_skills(sbx, skill_dirs)
-
-            new_entry = _Entry(sbx, user_id, session_ids={session_id})
-            new_entry.workdir = session_dir
-            self._cache[wid] = new_entry
-            logger.info(
-                f"[opensandbox_ws] 创建沙箱 wid={wid} sandbox_id={sbx.id} "
-                f"active_sandboxes={len(self._cache)}"
-            )
-            return sbx
+                return sbx
+            finally:
+                if dist_locked:
+                    await self._redis_release_lock(wid)
 
     async def _inject_skills(self, sbx: Sandbox, skill_dirs: list[str]) -> None:
         """将宿主技能目录内容写入沙箱 /workspace/skills/ 目录。"""
@@ -413,7 +612,8 @@ class OpenSandboxWorkspaceManager:
         async with lock:
             entry = self._cache.get(wid)
             if entry is None:
-                return None
+                # 多副本：本地未命中，查 Redis 映射跨 Pod 复用
+                return await self._connect_from_redis(wid, user_id, session_id)
             if (time.monotonic() - entry.last_access) > self._ttl:
                 await self._evict_locked(wid)
                 return None
@@ -428,6 +628,8 @@ class OpenSandboxWorkspaceManager:
             entry.workdir = session_dir
             # 在 Sandbox 对象上设置 workdir，兼容 AgentRegistry 的 system_prompt 构建
             entry.sandbox.workdir = session_dir
+            # 多副本：复用成功刷新 Redis 映射 TTL
+            await self._redis_set_map(wid, entry.sandbox.id)
             return entry.sandbox
 
     # ---- 兼容 agentscope workspace 接口 ----
@@ -540,27 +742,40 @@ class OpenSandboxWorkspaceManager:
             return None
         return rel
 
-    async def list_session_files(self, user_id: str, session_id: str) -> set[str]:
-        """列出会话工作目录下所有文件的相对路径集合（POSIX /）。
+    async def list_session_files(
+        self, user_id: str, session_id: str
+    ) -> dict[str, tuple[str, str]]:
+        """列出会话工作目录下所有文件及其修改签名。
 
-        跳过顶层 data/skills 目录和 .mcp 文件；沙箱不存在/目录为空/异常返回空集合。
+        返回 {相对路径: (mtime, size)}（POSIX /），供快照差分识别
+        同路径文件的内容变化（重生成/覆盖场景）。
+        跳过顶层 data/skills 目录和 .mcp 文件；沙箱不存在/目录为空/异常返回空 dict。
         """
         try:
             adapter = await self._get_adapter(user_id, session_id)
             if adapter is None:
-                return set()
+                return {}
             session_dir = self._session_dir(session_id)
             result = await adapter.bash(
-                f"cd {session_dir} && find . -type f 2>/dev/null || true"
+                f"cd {session_dir} && "
+                "find . -type f -printf '%T@ %s %p\\n' 2>/dev/null || true"
             )
             stdout = result.get("stdout", "") if isinstance(result, dict) else ""
-            files: set[str] = set()
+            files: dict[str, tuple[str, str]] = {}
             for line in stdout.splitlines():
                 line = line.strip()
                 if not line:
                     continue
+                # 格式 "mtime size ./path"（路径可含空格，只切前两段）
+                parts = line.split(maxsplit=2)
+                if len(parts) == 3:
+                    mtime, size, raw = parts
+                    sig = (mtime, size)
+                else:
+                    # 非预期输出：按纯路径兜底，签名为 None（视为未变更）
+                    raw, sig = line, None
                 # 去掉 ./ 前缀
-                rel = line[2:] if line.startswith("./") else line
+                rel = raw[2:] if raw.startswith("./") else raw
                 rel = rel.lstrip("/")
                 if not rel:
                     continue
@@ -571,7 +786,7 @@ class OpenSandboxWorkspaceManager:
                 # 跳过 .mcp 文件
                 if rel == ".mcp" or rel.endswith("/.mcp"):
                     continue
-                files.add(rel)
+                files[rel] = sig
             return files
         except Exception:
             logger.warning(
@@ -579,7 +794,7 @@ class OpenSandboxWorkspaceManager:
                 f"user={user_id} session={session_id}",
                 exc_info=True,
             )
-            return set()
+            return {}
 
     async def read_session_file(
         self, user_id: str, session_id: str, rel_path: str
