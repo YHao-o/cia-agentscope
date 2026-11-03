@@ -63,6 +63,8 @@ async def lifespan(app: FastAPI):
         decode_responses=False,
     )
     app.state.redis_client = redis_client
+    from app.services.feedback_service import configure_feedback
+    configure_feedback(redis_client)
     logger.info("Redis client initialized (%s)", REDIS_URL)
 
     # ---- 工作区管理器（OpenSandbox，唯一后端） ----
@@ -162,8 +164,8 @@ async def lifespan(app: FastAPI):
     else:
         logger.info("Langfuse service disabled (credentials not configured)")
 
-    # 会话取消标志注册表：session_id → asyncio.Event（/chat/stop 触发 set，生成器检测后中断）
-    app.state.chat_tasks: dict[str, asyncio.Event] = {}
+    # 当前 Pod 的会话运行注册表；跨 Pod 互斥与停止由 Redis 协调。
+    app.state.chat_tasks: dict = {}  # session_id -> 本 Pod 持有的 ChatRun
 
     yield
 
@@ -174,7 +176,7 @@ async def lifespan(app: FastAPI):
     except Exception:
         logger.warning("Regulations KB client close failed", exc_info=True)
 
-    # 关闭工作区管理器（停清扫 + 销毁全部容器）
+    # Redis 共享沙箱不能随某个后端 Pod 退出而销毁；只关闭本地连接。
     await workspace_manager.stop_sweeper()
     await workspace_manager.close_all()
     logger.info("Workspace manager closed")

@@ -707,6 +707,7 @@ async def generate_response(
     knowledge_bases: List[str] = None,
     cancel_event: Optional[asyncio.Event] = None,
     workspace_manager: Any = None,
+    run_id: Optional[str] = None,
 ) -> AsyncGenerator[str, None]:
     """根据消息列表生成流式回复（多智能体编排版本）。
 
@@ -719,7 +720,7 @@ async def generate_response(
     yield message_replace 事件并跳过推荐问题，持久化与文件检测仍执行。
     """
     # 取消检查：本地 event（同 Pod /chat/stop set）或 Redis 停止标志
-    # chat_stop:{session_id}（K8s 多副本下 /chat/stop 可能路由到其他 Pod）。
+    # chat_stop:{session_id}:{run_id}，旧轮停止信号不作用于后续轮次。
     # Redis 查询按 monotonic 时间节流：同一秒内最多真实查询一次（缓存上次
     # 结果与时间戳）；本地 event 已 set 时直接 True 不查 Redis。
     # redis_client 缺失或 Redis 异常 → 仅本地判断，异常只告警一次避免刷屏。
@@ -727,7 +728,7 @@ async def generate_response(
         getattr(request.app.state, "redis_client", None)
         if request is not None else None
     )
-    stop_key = f"chat_stop:{session_id}" if session_id else None
+    stop_key = f"chat_stop:{session_id}:{run_id}" if session_id and run_id else None
     _redis_warned = False
     _last_redis_check = 0.0
     _last_redis_stopped = False

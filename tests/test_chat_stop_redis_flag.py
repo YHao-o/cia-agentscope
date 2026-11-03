@@ -1,20 +1,9 @@
-"""K8s 多副本：/chat/stop Redis 停止标志与流清理测试（纯 mock）。
+"""Full generate_response cancellation integration tests (requires app SDKs).
 
-覆盖多副本中断链路新增逻辑（redis 一律 AsyncMock，无真实连接）：
-1. /chat/stop 无条件写 chat_stop:{session_id}（"1"，EX 300）——会话可能
-   运行在其他 Pod，本地注册表查不到也照样写；Redis 未配置/异常仅告警，
-   不影响本地停止与返回值
-2. /chat 流结束（finally）删除 chat_stop:{session_id}，本地注册表同步清理
-3. generate_response._cancelled（闭包不可单独导入，采用与
-   test_message_pair_and_citations.py 相同的最小化驱动）：
-   - Redis 轮询按 monotonic 节流：同一秒内多个取消检查点只真实查询一次
-   - Redis 标志存在 → _cancelled() 为 True → 主动中断（user_abort）
-   - 本地 cancel_event 已置位 → 直接中断，不查 Redis（exists 不被调用）
-
-说明：节流窗口依赖真实 monotonic 时钟，无法在单测中把窗口拨过 1 秒后
-观察第二次真实查询（不 patch 全局 time.monotonic，避免干扰事件循环），
-故"exists=1 时两次连续调用只查一次"的理想场景拆为：
-节流（exists=0 连续多检查点只查 1 次）+ 命中即中断（exists=1 只查 1 次）。
+Per-round Redis keys prevent a stale stop from aborting a later round.
+Route ownership, cross-Pod stop, cleanup and duplicate-request behavior are
+covered by test_chat_multireplica.py; this file exercises event throttling
+and interrupted conversation persistence through the real generator.
 """
 import asyncio
 import json
@@ -114,101 +103,12 @@ def _drive(orch, redis, cancel_event=None, session_service=None):
         request=_make_request(redis),
         cancel_event=cancel_event,
         workspace_manager=None,
+        run_id="run-1",
     )
 
 
-# ---- /chat/stop：无条件写 Redis 停止标志 ----
-
-def _make_stop_request(redis, chat_tasks):
-    request = MagicMock()
-    request.app = SimpleNamespace(
-        state=SimpleNamespace(redis_client=redis, chat_tasks=chat_tasks)
-    )
-    return request
-
-
-@pytest.mark.asyncio
-async def test_stop_writes_redis_flag():
-    """会话在本地运行时：无条件写 Redis 停止标志（key/value/EX 300），
-    同时照常触发本地 cancel_event。"""
-    redis = AsyncMock()
-    cancel_event = asyncio.Event()
-    request = _make_stop_request(redis, {"sess-1": cancel_event})
-
-    resp = await stop_chat(request, StopRequest(session_id="sess-1"), {"user_id": "u1"})
-
-    # 无条件写标志：会话可能运行在其他 Pod（本地注册表查不到也得写）
-    redis.set.assert_awaited_once_with("chat_stop:sess-1", "1", ex=300)
-    assert cancel_event.is_set()  # 本地停止逻辑不受影响
-    assert resp["ok"] is True
-
-
-@pytest.mark.asyncio
-async def test_stop_redis_failure_degrades():
-    """Redis 写标志抛异常 → 仅告警，本地停止与返回值不受影响。"""
-    redis = AsyncMock()
-    redis.set.side_effect = RuntimeError("redis down")
-    cancel_event = asyncio.Event()
-    request = _make_stop_request(redis, {"sess-1": cancel_event})
-
-    resp = await stop_chat(request, StopRequest(session_id="sess-1"), {"user_id": "u1"})
-
-    assert resp["ok"] is True
-    assert cancel_event.is_set()
-
-
-@pytest.mark.asyncio
-async def test_stop_without_redis_client():
-    """redis_client 未配置 → 跳过写标志，不抛异常，本地停止照常。"""
-    cancel_event = asyncio.Event()
-    request = _make_stop_request(None, {"sess-1": cancel_event})
-
-    resp = await stop_chat(request, StopRequest(session_id="sess-1"), {"user_id": "u1"})
-
-    assert resp["ok"] is True
-    assert cancel_event.is_set()
-
-
-# ---- /chat 流结束：finally 清理 Redis 停止标志 ----
-
-def _make_chat_request(redis, session_service):
-    request = MagicMock()
-    request.headers = {}
-    request.app.state.chat_tasks = {}
-    request.app.state.redis_client = redis
-    request.app.state.session_service = session_service
-    request.app.state.orchestrator_service = MagicMock()
-    request.app.state.langfuse_service = None
-    request.app.state.workspace_manager = None
-    return request
-
-
-@pytest.mark.asyncio
-async def test_stream_finally_deletes_flag():
-    """流正常结束（finally）：删除 chat_stop:{session_id}（避免残留影响
-    同 session 后续请求），本地注册表同步清理。"""
-    redis = AsyncMock()
-    session_service = MagicMock()
-    session_service.get_or_create_session = AsyncMock(return_value="sess-1")
-    request = _make_chat_request(redis, session_service)
-    body = ChatRequest(
-        messages=[{"role": "user", "content": "你好"}], session_id="sess-1"
-    )
-
-    async def fake_generate_response(**kwargs):
-        yield 'data: {"type": "summary", "content": "hi"}\n\n'
-
-    with patch("app.routes.chat.generate_response",
-               side_effect=fake_generate_response):
-        resp = await chat(request, body, {"user_id": "u1"})
-        events = [chunk async for chunk in resp.body_iterator]
-
-    redis.delete.assert_awaited_once_with("chat_stop:sess-1")
-    assert request.app.state.chat_tasks == {}  # 注册表清理
-    types = _parse_types(events)
-    assert types[0] == "session_ready"
-    assert "summary" in types
-
+# Route, ownership and cleanup regressions live in test_chat_multireplica.py.
+# This file keeps full generate_response integration tests with app SDKs installed.
 
 # ---- generate_response._cancelled：本地优先 / Redis 节流轮询 / 跨 Pod 中断 ----
 
@@ -229,7 +129,7 @@ async def test_cancelled_throttled_redis_poll(monkeypatch):
     events = [ev async for ev in _drive(orch, redis)]
 
     # 3 个取消检查点命中同一节流窗口 → exists 只被真实调用一次
-    redis.exists.assert_awaited_once_with("chat_stop:sess-1")
+    redis.exists.assert_awaited_once_with("chat_stop:sess-1:run-1")
     types = _parse_types(events)
     assert "user_abort" not in types        # 未中断
     assert types.count("summary") == 2      # 两个事件均正常透传
@@ -253,7 +153,7 @@ async def test_cancelled_redis_flag_aborts_stream(monkeypatch):
     session_service = _make_session_service()
     events = [ev async for ev in _drive(orch, redis, session_service=session_service)]
 
-    redis.exists.assert_awaited_once_with("chat_stop:sess-1")
+    redis.exists.assert_awaited_once_with("chat_stop:sess-1:run-1")
     types = _parse_types(events)
     assert "user_abort" in types
     assert types.count("summary") == 0  # 命中检查点后事件不再透传

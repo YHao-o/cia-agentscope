@@ -12,11 +12,12 @@
 - 结构化监控日志（创建延迟、成功率、活跃沙箱数）
 """
 import asyncio
+import inspect
+import json
 import logging
 import os
-import socket
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from opensandbox import Sandbox
@@ -29,6 +30,13 @@ from app.services.workspace_file_access import (
     build_list_skills_command,
     parse_skills_output,
 )
+from app.services.redis_lease import (
+    COMPARE_DELETE,
+    CoordinationUnavailable,
+    LeaseLost,
+    RedisLease,
+)
+from app.services.chat_runtime import current_chat_run
 
 logger = logging.getLogger(__name__)
 
@@ -42,6 +50,32 @@ _DEGRADE_RECOVERY_TIME = 60.0    # 降级后恢复探测间隔（秒）
 _DIST_LOCK_TTL = 30              # 新建沙箱分布式锁 TTL（秒）
 _DIST_LOCK_WAIT_TIMEOUT = 30.0   # 等待分布式锁总超时（秒）
 _DIST_LOCK_POLL_INTERVAL = 0.5   # 等锁轮询间隔（秒）
+_PREPARE_RETRY_TIMES = 2
+_PREPARE_RETRY_DELAY = 1.0
+_MAP_TTL_SAFETY_MARGIN = 60
+
+# Publish only while owning the creation lease, and never overwrite an existing
+# mapping. A creator whose lease expired cannot expose its sandbox to other Pods.
+_PUBLISH_MAP = """-- workspace_publish
+if redis.call('get', KEYS[1]) ~= ARGV[1] then return 0 end
+if redis.call('exists', KEYS[2]) == 1 then return 0 end
+redis.call('set', KEYS[2], ARGV[2], 'EX', ARGV[3])
+return 1
+"""
+
+_RETIRE_MAP = """-- workspace_retire
+if redis.call('get', KEYS[1]) ~= ARGV[1] then return 0 end
+if redis.call('get', KEYS[2]) ~= ARGV[2] then return 0 end
+return redis.call('del', KEYS[2])
+"""
+
+
+class SandboxNearExpiry(RuntimeError):
+    pass
+
+
+class SessionDirectoryError(RuntimeError):
+    pass
 
 
 class _Entry:
@@ -93,6 +127,8 @@ class OpenSandboxWorkspaceManager:
         # 多副本：Redis 客户端（None 时退化为单进程内存映射行为）
         self._redis = redis_client
         self._cache: dict[str, _Entry] = {}
+        self._deferred_clients: list[tuple[str, Sandbox]] = []
+        self._closing = False
         self._locks: dict[str, asyncio.Lock] = {}
         self._struct_lock = asyncio.Lock()
         self._sweeper_task: Optional[asyncio.Task] = None
@@ -127,74 +163,45 @@ class OpenSandboxWorkspaceManager:
                 self._locks[wid] = lock
             return lock
 
-    # ---- 多副本：Redis 用户→沙箱映射 / 分布式锁 ----
-    # 所有方法绝不抛异常：Redis 未配置/异常时返回 None/False，退化为单进程行为。
+    # ---- 多副本：Redis 用户→沙箱映射 ----
+    # Redis 已配置时必须完成协调；读取失败不能被误认为“没有沙箱”。
     async def _redis_get_map(self, wid: str) -> Optional[str]:
-        """读取 wid → sandbox_id 映射；无映射/异常返回 None。"""
+        """读取映射；仅确实无映射时返回 None，Redis 故障时快速失败。"""
         if self._redis is None:
             return None
         try:
-            value = await self._redis.get(f"sandbox_map:{wid}")
+            value = await asyncio.wait_for(self._redis.get(f"sandbox_map:{wid}"), timeout=5)
             if value is None:
                 return None
             if isinstance(value, bytes):
                 return value.decode("utf-8")
             return str(value)
         except Exception as e:
-            logger.warning(f"[opensandbox_ws] Redis 读取映射失败 wid={wid} error={e}")
-            return None
+            raise CoordinationUnavailable("Redis 沙箱映射暂不可用，请稍后重试") from e
 
-    async def _redis_set_map(self, wid: str, sandbox_id: str) -> bool:
-        """写入 wid → sandbox_id 映射并刷新 TTL（与沙箱 TTL 一致）；失败返回 False。"""
+    async def _redis_publish_map(self, wid: str, sandbox_id: str, lease: RedisLease, expires_at=None) -> None:
+        """在持有创建租约的同一个 Redis 原子操作内发布沙箱。"""
+        map_ttl = self._remaining_map_ttl(expires_at)
+        try:
+            published = await asyncio.wait_for(self._redis.eval(
+                _PUBLISH_MAP, 2, f"sandbox_lock:{wid}", f"sandbox_map:{wid}",
+                lease.token, sandbox_id, map_ttl,
+            ), timeout=lease.io_timeout)
+        except Exception as e:
+            raise CoordinationUnavailable("Redis 沙箱映射发布失败") from e
+        if not published:
+            raise LeaseLost("沙箱创建租约已失效或映射已更新，请重试")
+
+    async def _redis_del_map(self, wid: str, sandbox_id: str) -> bool:
+        """只删除已经确认消失的同一个沙箱，保护其他 Pod 的新映射。"""
         if self._redis is None:
             return False
         try:
-            await self._redis.set(
-                f"sandbox_map:{wid}", sandbox_id, ex=int(self._ttl)
-            )
-            return True
+            return bool(await asyncio.wait_for(self._redis.eval(
+                COMPARE_DELETE, 1, f"sandbox_map:{wid}", sandbox_id,
+            ), timeout=5))
         except Exception as e:
-            logger.warning(
-                f"[opensandbox_ws] Redis 写入映射失败 wid={wid} "
-                f"sandbox_id={sandbox_id} error={e}"
-            )
-            return False
-
-    async def _redis_del_map(self, wid: str) -> bool:
-        """删除 wid → sandbox_id 映射；失败返回 False。"""
-        if self._redis is None:
-            return False
-        try:
-            await self._redis.delete(f"sandbox_map:{wid}")
-            return True
-        except Exception as e:
-            logger.warning(f"[opensandbox_ws] Redis 删除映射失败 wid={wid} error={e}")
-            return False
-
-    async def _redis_acquire_lock(self, wid: str, token: str) -> Optional[bool]:
-        """尝试获取新建沙箱分布式锁（SET NX EX）。
-
-        返回 True=拿到锁，False=被其他 Pod 持有，None=Redis 异常。
-        """
-        if self._redis is None:
-            return None
-        try:
-            ok = await self._redis.set(
-                f"sandbox_lock:{wid}", token, ex=_DIST_LOCK_TTL, nx=True
-            )
-            return bool(ok)
-        except Exception as e:
-            logger.warning(f"[opensandbox_ws] Redis 获取锁失败 wid={wid} error={e}")
-            return None
-
-    async def _redis_release_lock(self, wid: str) -> None:
-        """释放新建沙箱分布式锁（简单 DEL）。"""
-        if self._redis is None:
-            return
-        try:
-            await self._redis.delete(f"sandbox_lock:{wid}")
-        except Exception as e:
-            logger.warning(f"[opensandbox_ws] Redis 释放锁失败 wid={wid} error={e}")
+            raise CoordinationUnavailable("Redis 沙箱映射清理失败") from e
 
     # ---- 高可用：降级检查 ----
     def _check_degraded(self) -> bool:
@@ -251,6 +258,20 @@ class OpenSandboxWorkspaceManager:
             while self._warm_pool:
                 sbx = self._warm_pool.pop()
                 if await self._is_sandbox_alive(sbx):
+                    if self._redis is not None:
+                        try:
+                            info = await asyncio.wait_for(sbx.get_info(), timeout=5)
+                            self._remaining_map_ttl(info.expires_at)
+                        except Exception as exc:
+                            try:
+                                await sbx.destroy()  # Unassigned pool entry has no users.
+                            except Exception:
+                                logger.warning("[opensandbox_ws] 回收不可分配的预热沙箱失败", exc_info=True)
+                            finally:
+                                await self._close_client(sbx)
+                            if isinstance(exc, SandboxNearExpiry):
+                                continue
+                            raise
                     logger.info(
                         f"[opensandbox_ws] 从预热池分配 sandbox_id={sbx.id} "
                         f"remaining={len(self._warm_pool)}"
@@ -368,6 +389,19 @@ class OpenSandboxWorkspaceManager:
     async def _evict_locked(self, wid: str) -> None:
         entry = self._cache.pop(wid, None)
         if entry is not None:
+            if self._redis is not None:
+                # 本地 TTL/退出仅释放当前 Pod 的 SDK 连接。其他 Pod 仍可能
+                # 使用该沙箱；共享沙箱的最终销毁由 server TTL 负责。
+                if not self._closing:
+                    try:
+                        active = await asyncio.wait_for(self._other_active_runs(wid, ""), timeout=5)
+                    except Exception:
+                        active = True  # Unknown usage must not close an in-flight SDK client.
+                    if active:
+                        self._deferred_clients.append((wid, entry.sandbox))
+                        return
+                await self._close_client(entry.sandbox)
+                return
             try:
                 await entry.sandbox.destroy()
             except Exception as e:
@@ -380,9 +414,152 @@ class OpenSandboxWorkspaceManager:
                     )
                 else:
                     logger.exception(f"[opensandbox_ws] 销毁沙箱失败 wid={wid}")
-            # 多副本：同步删除 Redis 映射，避免其他 Pod connect 到已销毁沙箱
-            await self._redis_del_map(wid)
             logger.info(f"[opensandbox_ws] 淘汰工作区 wid={wid}")
+
+    @staticmethod
+    async def _close_client(sbx: Sandbox) -> None:
+        """释放 SDK 客户端资源，不触发远端 destroy。"""
+        close = getattr(sbx, "close", None)
+        if close is None:
+            return
+        try:
+            result = close()
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            logger.warning("[opensandbox_ws] 关闭 SDK 连接失败", exc_info=True)
+
+    async def _drain_deferred_clients(self, force=False):
+        pending, self._deferred_clients = self._deferred_clients, []
+        for wid, sbx in pending:
+            try:
+                active = not force and await asyncio.wait_for(self._other_active_runs(wid, ""), timeout=5)
+            except Exception:
+                active = True
+            if active:
+                self._deferred_clients.append((wid, sbx))
+            else:
+                await self._close_client(sbx)
+
+    @staticmethod
+    def _sandbox_gone(exc: Exception) -> bool:
+        # 连接超时、connection reset 和普通非零退出均不能证明沙箱消失。
+        return ("SANDBOX_NOT_FOUND" in str(exc)
+                or getattr(exc, "code", None) == "SANDBOX_NOT_FOUND"
+                or getattr(getattr(exc, "error", None), "code", None) == "SANDBOX_NOT_FOUND")
+
+    async def _prepare_shared_session(self, sbx: Sandbox, session_id: str) -> None:
+        """保留 SDK 异常类型，区分明确不存在和临时不可达。"""
+        result = await sbx.commands.run(f"mkdir -p {self._session_dir(session_id)} && echo 1")
+        if result.exit_code != 0:
+            raise SessionDirectoryError("已有沙箱会话目录暂不可用，请稍后重试")
+
+    def _remaining_map_ttl(self, expires_at) -> int:
+        if expires_at is None or expires_at.tzinfo is None:
+            raise CoordinationUnavailable("无法确认沙箱实际到期时间")
+        margin = min(_MAP_TTL_SAFETY_MARGIN, self._ttl / 10)
+        remaining = int((expires_at - datetime.now(timezone.utc)).total_seconds() - margin)
+        if remaining < 1:
+            raise SandboxNearExpiry("沙箱剩余有效期不足，请重新创建")
+        return remaining
+
+    @staticmethod
+    def _prepare_retryable(exc: Exception) -> bool:
+        code = getattr(getattr(exc, "error", None), "code", None)
+        return isinstance(exc, (SessionDirectoryError, ConnectionError, TimeoutError)) or code in {
+            "UNHEALTHY", "CONNECTION", "TIMEOUT", "RATE_LIMIT",
+        }
+
+    async def _prepare_with_retry(self, sbx: Sandbox, session_id: str) -> None:
+        for attempt in range(_PREPARE_RETRY_TIMES + 1):
+            try:
+                await self._prepare_shared_session(sbx, session_id)
+                return
+            except Exception as exc:
+                if self._sandbox_gone(exc) or not self._prepare_retryable(exc) or attempt == _PREPARE_RETRY_TIMES:
+                    raise
+                await asyncio.sleep(_PREPARE_RETRY_DELAY)
+
+    async def _other_active_runs(self, wid: str, session_id: str) -> bool:
+        own = current_chat_run.get()
+        async for key in self._redis.scan_iter(match="chat_run:*"):
+            raw = await self._redis.get(key)
+            if raw is None:
+                continue
+            token = raw.decode("utf-8") if isinstance(raw, bytes) else raw
+            state = json.loads(token)
+            if not isinstance(state, dict) or "user_id" not in state or "run_id" not in state:
+                raise CoordinationUnavailable("会话运行记录异常，不能安全切换沙箱")
+            if self._workspace_id(str(state["user_id"])) != wid:
+                continue
+            name = key.decode("utf-8") if isinstance(key, bytes) else key
+            if own == (session_id, token) and name == f"chat_run:{session_id}":
+                continue
+            return True
+        return False
+
+    async def _global_fault_confirmed(self, sbx: Sandbox) -> bool:
+        try:
+            info = await asyncio.wait_for(sbx.get_info(), timeout=5)
+            if info.status.state in {"Failed", "Terminated", "Error"}:
+                return True
+            for attempt in range(2):
+                try:
+                    result = await asyncio.wait_for(sbx.commands.run("echo 1"), timeout=5)
+                    if result.exit_code == 0:
+                        return False  # One directory is broken; the sandbox is usable.
+                except Exception as exc:
+                    if getattr(getattr(exc, "error", None), "code", None) != "UNHEALTHY":
+                        return False  # Transport/auth errors cannot prove sandbox damage.
+                if attempt == 0:
+                    await asyncio.sleep(_PREPARE_RETRY_DELAY)
+            return True
+        except Exception:
+            return False
+
+    async def _retire_shared_sandbox(self, wid, sandbox_id, session_id, sbx=None, lease=None):
+        """Quiescent, proven-bad generation only; preserve old data until server TTL."""
+        own_lease = lease is None
+        connected = None
+        if own_lease:
+            lease = RedisLease(self._redis, f"sandbox_lock:{wid}", wait_timeout=5)
+        try:
+            if own_lease and not await lease.acquire():
+                return False
+            await lease.assert_owned()
+            if await self._redis_get_map(wid) != sandbox_id:
+                return True
+            try:
+                if await asyncio.wait_for(self._other_active_runs(wid, session_id), timeout=5):
+                    return False
+            except Exception as exc:
+                raise CoordinationUnavailable("无法确认沙箱是否仍被其他会话使用") from exc
+            if sbx is None:
+                try:
+                    connected = await Sandbox.connect(sandbox_id, connection_config=self._config, skip_health_check=True)
+                    sbx = connected
+                except Exception:
+                    return False
+            if not await self._global_fault_confirmed(sbx):
+                return False
+            await lease.assert_owned()
+            try:
+                retired = await asyncio.wait_for(self._redis.eval(
+                    _RETIRE_MAP, 2, f"sandbox_lock:{wid}", f"sandbox_map:{wid}",
+                    lease.token, sandbox_id,
+                ), timeout=lease.io_timeout)
+            except Exception as exc:
+                raise CoordinationUnavailable("沙箱切换失败") from exc
+            if not retired:
+                await lease.assert_owned()
+                return await self._redis_get_map(wid) != sandbox_id
+            logger.warning("[opensandbox_ws] 已停止分配故障沙箱 wid=%s sandbox_id=%s；由服务端 TTL 清理", wid, sandbox_id)
+            return True
+        finally:
+            if connected is not None:
+                await self._close_client(connected)
+            if own_lease:
+                await lease.release()
 
     async def _evict(self, wid: str) -> None:
         lock = await self._get_lock(wid)
@@ -390,18 +567,33 @@ class OpenSandboxWorkspaceManager:
             await self._evict_locked(wid)
 
     async def _reuse_local_entry(self, wid: str, session_id: str) -> Optional[Sandbox]:
-        """复用本地 cache 中存活的沙箱（原 create_workspace 复用逻辑）。
-
-        不存在/过期/已崩溃 → 返回 None，调用方继续走 Redis 或新建；
-        复用成功会刷新 Redis 映射 TTL（多副本下保持映射不过期）。
-        """
+        """复用本地连接；共享模式每次以 Redis 映射为准，不回写旧 ID。"""
         entry = self._cache.get(wid)
         if entry is None:
             return None
         if (time.monotonic() - entry.last_access) > self._ttl:
+            await self._evict_locked(wid)
             return None
+        if self._redis is not None:
+            if await self._redis_get_map(wid) != entry.sandbox.id:
+                await self._evict_locked(wid)
+                return None
+            try:
+                await self._prepare_with_retry(entry.sandbox, session_id)
+            except Exception as exc:
+                if self._sandbox_gone(exc):
+                    await self._evict_locked(wid)
+                    await self._redis_del_map(wid, entry.sandbox.id)
+                    return None
+                if self._prepare_retryable(exc) and await self._retire_shared_sandbox(wid, entry.sandbox.id, session_id, sbx=entry.sandbox):
+                    await self._evict_locked(wid)
+                    return None
+                raise
+            if await self._redis_get_map(wid) != entry.sandbox.id:
+                await self._evict_locked(wid)
+                return None
         # 高可用：探测沙箱存活
-        if not await self._touch_session_dir(entry.sandbox, session_id):
+        elif not await self._touch_session_dir(entry.sandbox, session_id):
             logger.warning(f"[opensandbox_ws] 沙箱已崩溃，重建 wid={wid}")
             await self._evict_locked(wid)
             return None
@@ -411,48 +603,40 @@ class OpenSandboxWorkspaceManager:
         entry.workdir = session_dir
         # 在 Sandbox 对象上设置 workdir，兼容 AgentRegistry 的 system_prompt 构建
         entry.sandbox.workdir = session_dir
-        # 多副本：复用成功刷新 Redis 映射 TTL
-        await self._redis_set_map(wid, entry.sandbox.id)
         logger.info(f"[opensandbox_ws] 复用沙箱 wid={wid} session={session_id}")
         return entry.sandbox
 
     async def _connect_from_redis(
-        self, wid: str, user_id: str, session_id: str
+        self, wid: str, user_id: str, session_id: str, lease=None
     ) -> Optional[Sandbox]:
-        """查 Redis 用户→沙箱映射，跨 Pod connect 复用其他 Pod 创建的沙箱。
-
-        无映射/connect 失败/沙箱已死 → 删映射并返回 None（调用方走新建）；
-        connect 成功 → _touch_session_dir 探活并建会话目录，
-        构造 _Entry 放入本地 cache，刷新 Redis TTL 后返回。
-        """
+        """连接共享沙箱；只有明确不存在时才比较删除映射。"""
         sandbox_id = await self._redis_get_map(wid)
         if not sandbox_id:
             return None
+        sbx = None
         try:
             sbx = await Sandbox.connect(sandbox_id, connection_config=self._config)
+            await self._prepare_with_retry(sbx, session_id)
+            if await self._redis_get_map(wid) != sandbox_id:
+                await self._close_client(sbx)
+                return None
         except Exception as e:
-            logger.warning(
-                f"[opensandbox_ws] 跨 Pod 连接沙箱失败，删除映射 wid={wid} "
-                f"sandbox_id={sandbox_id} error={e}"
-            )
-            await self._redis_del_map(wid)
-            return None
-        # 连接成功后探活（顺带建会话目录）
-        if not await self._touch_session_dir(sbx, session_id):
-            logger.warning(
-                f"[opensandbox_ws] 跨 Pod 沙箱已死亡，删除映射 wid={wid} "
-                f"sandbox_id={sandbox_id}"
-            )
-            await self._redis_del_map(wid)
-            return None
+            try:
+                if self._sandbox_gone(e):
+                    await self._redis_del_map(wid, sandbox_id)
+                    return None
+                if self._prepare_retryable(e) and await self._retire_shared_sandbox(wid, sandbox_id, session_id, sbx=sbx, lease=lease):
+                    return None
+                raise
+            finally:
+                if sbx is not None:
+                    await self._close_client(sbx)
         session_dir = self._session_dir(session_id)
         new_entry = _Entry(sbx, user_id, session_ids={session_id})
         new_entry.workdir = session_dir
         # 在 Sandbox 对象上设置 workdir，兼容 AgentRegistry 的 system_prompt 构建
         sbx.workdir = session_dir
         self._cache[wid] = new_entry
-        # 多副本：复用成功刷新 Redis 映射 TTL
-        await self._redis_set_map(wid, sbx.id)
         logger.info(
             f"[opensandbox_ws] 跨 Pod 复用沙箱 wid={wid} sandbox_id={sandbox_id} "
             f"session={session_id}"
@@ -487,58 +671,31 @@ class OpenSandboxWorkspaceManager:
             if sbx is not None:
                 return sbx
 
-            # 3. 分布式锁内新建（Redis 未配置/异常时退化为直接新建）
-            dist_locked = False
+            # 3. Redis 已配置时必须持有可续租的创建锁，覆盖慢创建及所有重试。
+            lease = None
+            sbx = None
+            published = False
+            publish_attempted = False
             try:
                 if self._redis is not None:
-                    lock_token = f"{socket.gethostname()}:{os.getpid()}"
-                    acquired = await self._redis_acquire_lock(wid, lock_token)
-                    if acquired is None:
-                        logger.warning(
-                            f"[opensandbox_ws] Redis 锁获取异常，降级为无锁新建 wid={wid}"
-                        )
-                    elif acquired:
-                        dist_locked = True
-                    else:
-                        # 锁被其他 Pod 持有：轮询等待对方建好后复用，或等到锁
-                        deadline = time.monotonic() + _DIST_LOCK_WAIT_TIMEOUT
-                        while time.monotonic() < deadline:
-                            await asyncio.sleep(_DIST_LOCK_POLL_INTERVAL)
-                            # 重查本地 cache（其他协程可能已建好）
-                            reused = await self._reuse_local_entry(wid, session_id)
-                            if reused is not None:
-                                return reused
-                            # 重查 Redis 映射（其他 Pod 可能已建好）
-                            reused = await self._connect_from_redis(
-                                wid, user_id, session_id
-                            )
-                            if reused is not None:
-                                return reused
-                            acquired = await self._redis_acquire_lock(wid, lock_token)
-                            if acquired is True:
-                                dist_locked = True
-                                break
-                            if acquired is None:
-                                logger.warning(
-                                    f"[opensandbox_ws] Redis 锁等待中异常，"
-                                    f"降级为无锁新建 wid={wid}"
-                                )
-                                break
-                        else:
-                            logger.warning(
-                                f"[opensandbox_ws] 分布式锁等待超时 "
-                                f"{_DIST_LOCK_WAIT_TIMEOUT}s wid={wid}，降级为无锁新建"
-                            )
-                    if dist_locked:
-                        # 拿到锁后 double-check：其他 Pod 可能刚好建完并释放了锁
-                        reused = await self._reuse_local_entry(wid, session_id)
-                        if reused is not None:
-                            return reused
+                    lease = RedisLease(
+                        self._redis, f"sandbox_lock:{wid}", ttl=_DIST_LOCK_TTL,
+                        wait_timeout=_DIST_LOCK_WAIT_TIMEOUT,
+                        poll_interval=_DIST_LOCK_POLL_INTERVAL,
+                    )
+                    if not await lease.acquire():
+                        # 创建者可能已发布但尚未释放锁，允许复用该映射。
                         reused = await self._connect_from_redis(
                             wid, user_id, session_id
                         )
                         if reused is not None:
                             return reused
+                        raise CoordinationUnavailable("沙箱正在初始化，请稍后重试")
+                    await lease.assert_owned()
+                    # 拿锁后复查，避免等待期间其他 Pod 已经建好沙箱。
+                    reused = await self._connect_from_redis(wid, user_id, session_id, lease=lease)
+                    if reused is not None:
+                        return reused
 
                 # 创建新沙箱（带重试）
                 if langfuse_service:
@@ -555,7 +712,10 @@ class OpenSandboxWorkspaceManager:
                 else:
                     sbx = await self._create_sandbox_with_retry()
                 session_dir = self._session_dir(session_id)
-                if not await self._touch_session_dir(sbx, session_id):
+                if lease is not None:
+                    await lease.assert_owned()
+                    await self._prepare_shared_session(sbx, session_id)
+                elif not await self._touch_session_dir(sbx, session_id):
                     logger.warning(
                         f"[opensandbox_ws] 新建沙箱后会话目录准备失败 sandbox_id={sbx.id}"
                     )
@@ -564,19 +724,49 @@ class OpenSandboxWorkspaceManager:
                 if skill_dirs:
                     await self._inject_skills(sbx, skill_dirs)
 
+                if lease is not None:
+                    await lease.assert_owned()
+                    info = await asyncio.wait_for(sbx.get_info(), timeout=5)
+                    publish_attempted = True
+                    await self._redis_publish_map(wid, sbx.id, lease, expires_at=info.expires_at)
+                published = True
                 new_entry = _Entry(sbx, user_id, session_ids={session_id})
                 new_entry.workdir = session_dir
+                sbx.workdir = session_dir
                 self._cache[wid] = new_entry
-                # 多副本：写入 Redis 映射，供其他 Pod connect 复用
-                await self._redis_set_map(wid, sbx.id)
                 logger.info(
                     f"[opensandbox_ws] 创建沙箱 wid={wid} sandbox_id={sbx.id} "
                     f"active_sandboxes={len(self._cache)}"
                 )
                 return sbx
+            except BaseException:
+                if sbx is not None and publish_attempted and not published:
+                    # EVAL may have succeeded even if its response was lost. A
+                    # visible (or unverifiable) mapping may already have readers.
+                    try:
+                        published = await self._redis_get_map(wid) == sbx.id
+                    except CoordinationUnavailable:
+                        published = True  # Server TTL is safe; destroying may not be.
+                if sbx is not None and not published:
+                    # 未发布的实例没有共享使用者，即使租约丢失也应回收。
+                    try:
+                        await sbx.destroy()
+                    except Exception:
+                        logger.warning("[opensandbox_ws] 回收未发布沙箱失败", exc_info=True)
+                    else:
+                        # 发布返回异常可能发生在 Redis 已写入之后。
+                        # 仅在确认销毁后比较删除自己的 ID。
+                        try:
+                            await self._redis_del_map(wid, sbx.id)
+                        except CoordinationUnavailable:
+                            logger.warning("[opensandbox_ws] 未发布沙箱映射待 TTL 回收")
+                    await self._close_client(sbx)
+                elif sbx is not None and published:
+                    await self._close_client(sbx)
+                raise
             finally:
-                if dist_locked:
-                    await self._redis_release_lock(wid)
+                if lease is not None:
+                    await lease.release()
 
     async def _inject_skills(self, sbx: Sandbox, skill_dirs: list[str]) -> None:
         """将宿主技能目录内容写入沙箱 /workspace/skills/ 目录。"""
@@ -606,31 +796,14 @@ class OpenSandboxWorkspaceManager:
     async def get_workspace(
         self, user_id: str, session_id: str
     ) -> Optional[Sandbox]:
-        """获取已有沙箱，超 TTL 或已崩溃则淘汰并返回 None。"""
+        """获取已有沙箱；共享模式过期只回收本地连接，再查全局映射。"""
         wid = self._workspace_id(user_id)
         lock = await self._get_lock(wid)
         async with lock:
-            entry = self._cache.get(wid)
-            if entry is None:
-                # 多副本：本地未命中，查 Redis 映射跨 Pod 复用
-                return await self._connect_from_redis(wid, user_id, session_id)
-            if (time.monotonic() - entry.last_access) > self._ttl:
-                await self._evict_locked(wid)
-                return None
-            # 合并探活与建目录：一次往返同时判断存活并准备会话目录
-            if not await self._touch_session_dir(entry.sandbox, session_id):
-                logger.warning(f"[opensandbox_ws] 沙箱已崩溃，淘汰 wid={wid}")
-                await self._evict_locked(wid)
-                return None
-            session_dir = self._session_dir(session_id)
-            entry.last_access = time.monotonic()
-            entry.session_ids.add(session_id)
-            entry.workdir = session_dir
-            # 在 Sandbox 对象上设置 workdir，兼容 AgentRegistry 的 system_prompt 构建
-            entry.sandbox.workdir = session_dir
-            # 多副本：复用成功刷新 Redis 映射 TTL
-            await self._redis_set_map(wid, entry.sandbox.id)
-            return entry.sandbox
+            reused = await self._reuse_local_entry(wid, session_id)
+            if reused is not None:
+                return reused
+            return await self._connect_from_redis(wid, user_id, session_id)
 
     # ---- 兼容 agentscope workspace 接口 ----
     def _entry_for(self, user_id: str) -> Optional["_Entry"]:
@@ -906,10 +1079,12 @@ class OpenSandboxWorkspaceManager:
         await self._evict(workspace_id)
 
     async def close_all(self) -> None:
+        self._closing = True
         # 先销毁预热池
         await self._destroy_pool()
         for wid in list(self._cache.keys()):
             await self._evict(wid)
+        await self._drain_deferred_clients(force=True)
         logger.info(
             f"[opensandbox_ws] 全部关闭 total_created={self._total_created} "
             f"total_failed={self._total_failed}"
@@ -953,6 +1128,7 @@ class OpenSandboxWorkspaceManager:
             ]
             for wid in expired:
                 await self._evict(wid)
+            await self._drain_deferred_clients()
             if expired:
                 logger.info(
                     f"[opensandbox_ws] sweeper 淘汰 {len(expired)} 个过期沙箱 "

@@ -1,60 +1,70 @@
 import asyncio
 import json
 import logging
-from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
+from starlette.background import BackgroundTask
 
 from app.dependencies import current_user
 from app.config import SSE_HEARTBEAT_INTERVAL
 from app.models.chat import ChatRequest
 from app.services.chat_service import generate_response
-from app.services.feedback_service import cancel_feedback, resolve_feedback
+from app.services.feedback_service import (
+    FeedbackBackendError, cancel_feedback_shared, resolve_feedback_shared,
+)
+from app.services.chat_runtime import (
+    ChatRun, RunBusy, CoordinationUnavailable, authorize_active_run, request_stop,
+)
 from app.dao.user_dao import fire_notify_mng_active
 
 logger = logging.getLogger(__name__)
-
 router = APIRouter()
+_SSE_HEARTBEAT = ": ping\n\n"
+_DONE = object()
 
-_SSE_HEARTBEAT = ": ping\n\n"   # SSE 注释行：EventSource/data: 解析器均忽略
-_DONE = object()                 # 队列结束哨兵
 
+async def _with_heartbeat(source, cancel_event=None):
+    """Pump SSE without cancelling an upstream await on heartbeat timeout.
 
-async def _with_heartbeat(source):
-    """SSE 心跳包装器：源流超过 SSE_HEARTBEAT_INTERVAL 秒无事件时发送 ': ping'。
-
-    用 queue + pump 而非 wait_for(anext)：后者超时会取消底层生成器的当前 await，
-    等于心跳本身"中断"会话。pump task 全程独立运行，仅在消费方退出（正常结束/
-    客户端断开）时被 cancel——取消语义与现状一致（CancelledError 照常传入
-    generate_response 的中断处理分支，落库/trace 收尾逻辑不变）。
-    源流抛异常时经队列透传给消费方，避免消费方无限心跳。
-    SSE_HEARTBEAT_INTERVAL <= 0 时直接透传源流。
+    A separate cancellation watcher can interrupt silent LLM/tool/feedback waits;
+    generate_response still owns partial-history persistence and user_abort events.
     """
-    if SSE_HEARTBEAT_INTERVAL <= 0:
+    if SSE_HEARTBEAT_INTERVAL <= 0 and cancel_event is None:
         async for ev in source:
             yield ev
         return
-
-    queue: asyncio.Queue = asyncio.Queue()
+    queue = asyncio.Queue()
 
     async def pump():
         try:
             async for ev in source:
                 await queue.put(ev)
-        except Exception as e:          # 源流异常 → 透传（否则消费方会无限心跳）
-            await queue.put(e)
-            return
-        await queue.put(_DONE)
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            await queue.put(exc)
+        finally:
+            await queue.put(_DONE)
 
     pump_task = asyncio.create_task(pump())
+
+    async def stop_pump():
+        await cancel_event.wait()
+        pump_task.cancel()
+        await asyncio.gather(pump_task, return_exceptions=True)
+        # Cover cancellation before pump() first executes as well.
+        await queue.put(_DONE)
+
+    stopper = asyncio.create_task(stop_pump()) if cancel_event is not None else None
     try:
         while True:
             try:
-                item = await asyncio.wait_for(
-                    queue.get(), timeout=SSE_HEARTBEAT_INTERVAL
-                )
+                if SSE_HEARTBEAT_INTERVAL > 0:
+                    item = await asyncio.wait_for(queue.get(), timeout=SSE_HEARTBEAT_INTERVAL)
+                else:
+                    item = await queue.get()
             except asyncio.TimeoutError:
                 yield _SSE_HEARTBEAT
                 continue
@@ -64,11 +74,11 @@ async def _with_heartbeat(source):
                 raise item
             yield item
     finally:
+        if stopper is not None:
+            stopper.cancel()
+            await asyncio.gather(stopper, return_exceptions=True)
         pump_task.cancel()
-        try:
-            await pump_task
-        except (asyncio.CancelledError, Exception):
-            pass
+        await asyncio.gather(pump_task, return_exceptions=True)
 
 
 class StopRequest(BaseModel):
@@ -76,123 +86,109 @@ class StopRequest(BaseModel):
 
 
 class FeedbackRequest(BaseModel):
-    """卡片反馈回传：唤醒挂起中的 render_feedback_card 工具。"""
     session_id: str
     feedback_id: str
-    action: str  # confirm / cancel / submit
+    action: str
     payload: dict = {}
 
 
 @router.post("/chat")
 async def chat(request: Request, body: ChatRequest, user: dict = Depends(current_user)):
-    # 异步上报 mng 用户活跃（fire-and-forget，失败不影响对话）
     authorization = request.headers.get("authorization", "")
     if authorization.lower().startswith("bearer "):
         jwt_token = authorization.split(" ", 1)[1].strip()
         if jwt_token:
             fire_notify_mng_active(jwt_token)
-
     session_service = request.app.state.session_service
     user_id = user.get("user_id")
-
-    # 获取或创建 session_id
     session_id = await session_service.get_or_create_session(body.session_id, user_id)
+    tasks = request.app.state.chat_tasks
+    if session_id in tasks:
+        raise HTTPException(status_code=409, detail="该会话正在生成，请等待当前轮结束")
+    run = ChatRun(getattr(request.app.state, "redis_client", None), session_id, user_id)
+    try:
+        await run.open()
+    except RunBusy as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except CoordinationUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    tasks[session_id] = run
 
-    # 创建取消标志并注册到 app.state.chat_tasks（供 /chat/stop 触发中断）
-    cancel_event = asyncio.Event()
-    request.app.state.chat_tasks[session_id] = cancel_event
+    async def cleanup():
+        try:
+            await cancel_feedback_shared(session_id)
+        except Exception:
+            logger.warning("[chat] 清理反馈失败", exc_info=True)
+        finally:
+            if tasks.get(session_id) is run:
+                tasks.pop(session_id, None)
+            await run.close()
 
     async def stream():
+        watcher = asyncio.create_task(run.watch_stop())
         try:
-            # 先发送 SESSION_READY 事件告知前端 session_id
-            session_event = {
-                "type": "session_ready",
-                "session_id": session_id,
-            }
-            yield f"data: {json.dumps(session_event, ensure_ascii=False)}\n\n"
-
-            # 用户输入的敏感检测（纯词典）在 generate_response 的根 span 内执行，
-            # 使 sensitive-dict-check span 嵌套在本轮会话 trace 中（非独立 trace）
-
-            # 再发送聊天流式事件（多智能体编排 / 单智能体直接问答）；
-            # _with_heartbeat 包一层：静默超阈值时发 ': ping' 注释行防代理切断
+            yield f"data: {json.dumps({'type': 'session_ready', 'session_id': session_id})}\n\n"
             async for event in _with_heartbeat(generate_response(
                 orchestrator_service=request.app.state.orchestrator_service,
-                messages=body.messages,
-                session_id=session_id,
-                user_id=user_id,
+                messages=body.messages, session_id=session_id, user_id=user_id,
                 session_service=session_service,
                 langfuse_service=request.app.state.langfuse_service,
-                agent_id=body.agent_id,
-                request=request,
-                search_enabled=body.search_enabled,
-                skills=body.skills,
+                agent_id=body.agent_id, request=request,
+                search_enabled=body.search_enabled, skills=body.skills,
                 knowledge_bases=body.knowledge_bases,
-                cancel_event=cancel_event,
+                cancel_event=run.cancel_event, run_id=run.run_id,
                 workspace_manager=getattr(request.app.state, "workspace_manager", None),
-            )):
+            ), cancel_event=run.cancel_event):
                 yield event
         finally:
-            # 流结束（正常/异常/中断）后清理注册表与挂起反馈
-            request.app.state.chat_tasks.pop(session_id, None)
-            # 同步删除 Redis 停止标志（跨 Pod 中断用），避免残留影响同 session 后续请求
-            try:
-                redis_client = getattr(request.app.state, "redis_client", None)
-                if redis_client is not None:
-                    await redis_client.delete(f"chat_stop:{session_id}")
-            except Exception:
-                logger.warning("[chat] 清理 Redis 停止标志失败", exc_info=True)
-            cancel_feedback(session_id)
+            watcher.cancel()
+            await asyncio.gather(watcher, return_exceptions=True)
+            await asyncio.shield(asyncio.create_task(cleanup()))
 
     try:
-        return StreamingResponse(stream(), media_type="text/event-stream")
-    except Exception as e:
-        request.app.state.chat_tasks.pop(session_id, None)
-        raise HTTPException(status_code=500, detail=str(e))
+        return StreamingResponse(
+            stream(), media_type="text/event-stream",
+            headers={"X-Accel-Buffering": "no", "Cache-Control": "no-cache"},
+            background=BackgroundTask(cleanup),
+        )
+    except Exception:
+        if tasks.get(session_id) is run:
+            tasks.pop(session_id, None)
+        await run.close()
+        raise
 
 
 @router.post("/chat/stop")
-async def stop_chat(
-    request: Request,
-    body: StopRequest,
-    user: dict = Depends(current_user),
-):
-    """停止正在进行的会话。
-
-    触发对应 session_id 的 cancel_event，generate_response 检测到后
-    主动 raise CancelledError 进入 finally：落库（success=False）+
-    flush trace + yield user_abort 事件。本接口立即返回，不等待中断完成。
-    K8s 多副本下另写 Redis 停止标志（EX 300），使运行在其他 Pod 上的
-    流式生成也能在检查点轮询到并中断。
-    """
-    session_id = body.session_id
-    # 无条件写 Redis 停止标志（会话可能运行在其他 Pod，本地查不到）；
-    # 失败仅告警，不影响本地停止逻辑与返回值
+async def stop_chat(request: Request, body: StopRequest, user: dict = Depends(current_user)):
+    """Stop only the caller's currently active round, including on another Pod."""
     try:
-        redis_client = getattr(request.app.state, "redis_client", None)
-        if redis_client is not None:
-            await redis_client.set(f"chat_stop:{session_id}", "1", ex=300)
-    except Exception:
-        logger.warning("[chat] 写入 Redis 停止标志失败", exc_info=True)
-
-    chat_tasks = getattr(request.app.state, "chat_tasks", {})
-    cancel_event = chat_tasks.get(session_id)
-    if cancel_event is None:
+        stopped = await request_stop(
+            getattr(request.app.state, "redis_client", None), body.session_id,
+            user.get("user_id"), getattr(request.app.state, "chat_tasks", {}).get(body.session_id),
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except CoordinationUnavailable as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
+    if not stopped:
         return {"ok": False, "msg": "会话不在运行中或已结束"}
-    cancel_event.set()
     return {"ok": True, "msg": "已发送停止信号"}
 
 
 @router.post("/chat/feedback")
-async def submit_feedback(body: FeedbackRequest, user: dict = Depends(current_user)):
-    """回传确认/表单卡片的用户反馈，唤醒同轮挂起的 render_feedback_card 工具。
-
-    返回 404 表示反馈已失效（超时、已处理或会话已结束），前端据此禁用卡片。
-    """
-    ok = resolve_feedback(
-        body.session_id, body.feedback_id,
-        {"action": body.action, "payload": body.payload},
-    )
+async def submit_feedback(request: Request, body: FeedbackRequest, user: dict = Depends(current_user)):
+    try:
+        active = await authorize_active_run(
+            getattr(request.app.state, "redis_client", None), body.session_id,
+            user.get("user_id"), getattr(request.app.state, "chat_tasks", {}).get(body.session_id),
+        )
+        ok = active is not None and await resolve_feedback_shared(
+            body.session_id, body.feedback_id, {"action": body.action, "payload": body.payload},
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except (CoordinationUnavailable, FeedbackBackendError) as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
     if not ok:
         raise HTTPException(status_code=404, detail="反馈已失效（超时、已处理或会话已结束）")
     return {"ok": True}
