@@ -8,7 +8,7 @@ from typing import Any, Optional
 
 from agentscope.state import AgentState
 
-from app.utils.event_serialization import sanitize_surrogates
+from app.utils.event_serialization import sanitize_text_recursive
 
 logger = logging.getLogger(__name__)
 
@@ -98,9 +98,12 @@ async def persist_agent_state(
     """保存单个 agent 的 AgentState（带非空校验与异常兜底）。"""
     if not (session_service and session_id and user_id and state_dict):
         return
-    # 清洗孤立代理字符：state.context 含模型原始输出，流式 chunk 切开的
-    # emoji 半字符会导致 DAO 层（MySQL/Redis）UTF-8 编码失败、state 丢失
-    state_dict = sanitize_surrogates(state_dict)
+    # 全链路清洗：state.context 含模型原始输出 + 工具结果，
+    # 流式 chunk 切断的 emoji（孤立代理）和 bash 输出的控制字符
+    # （null/ANSI/二进制片段）都会导致 DAO 层（MySQL/Redis）
+    # UTF-8 编码失败、state 丢失。升级为 sanitize_text_recursive，
+    # 两类问题一起兜住
+    state_dict = sanitize_text_recursive(state_dict)
     try:
         await session_service.save_agent_state(
             session_id, user_id, agent_id, state_dict,

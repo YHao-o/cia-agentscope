@@ -11,6 +11,7 @@ from typing import Any, Dict, Optional
 from openai import AsyncOpenAI
 
 from app.services.langfuse_service import get_current_langfuse
+from app.services.trace_serial import get_serial
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +65,9 @@ async def chat_complete(
                    {"role": "user", "content": user_prompt}],
         )
     try:
+        # 对话链路内统一携带 app_serial_number（ContextVar 由
+        # generate_response 入口设置）；非对话链路（健康探测等）不带
+        serial = get_serial()
         response = await client.chat.completions.create(
             model=model_name,
             messages=[
@@ -72,7 +76,8 @@ async def chat_complete(
             ],
             temperature=parameters.get("temperature", 0.1),
             max_tokens=parameters.get("max_tokens", 1024),
-            extra_body={"chat_template_kwargs": {"enable_thinking": False}}
+            extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+            **({"extra_headers": {"app_serial_number": serial}} if serial else {}),
         )
         text = response.choices[0].message.content or ""
         if obs is not None and lf is not None:

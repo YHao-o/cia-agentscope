@@ -85,6 +85,7 @@ async def llm_health(request: Request):
             messages=[{"role": "user", "content": "ping"}],
             max_tokens=16,
             extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+            extra_headers={"app_serial_number": "OIA-AGENTSCOPE-HEALTH"},
         )
     except APITimeoutError as e:
         return _llm_error(504, "timeout", str(e), model_name, base_url)

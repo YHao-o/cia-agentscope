@@ -11,13 +11,18 @@ from agentscope.tool import FunctionTool
 from agentscope.tool._response import ToolChunk, TextBlock
 
 from app.services.opensandbox_adapter import OpenSandboxToolAdapter
+from app.utils.event_serialization import sanitize_text
 
 logger = logging.getLogger(__name__)
 
 
 def _text_chunk(text: str) -> ToolChunk:
-    """构造文本结果的 ToolChunk。"""
-    return ToolChunk(content=[TextBlock(text=text)])
+    """构造文本结果的 ToolChunk。传入文本先做 JSON 安全清洗——
+    OpenSandbox bash 的 stdout/stderr 可能包含控制字符（null 字节、
+    ANSI 码被 SDK 截断、二进制片段等），若不经清洗直接混入 LLM
+    请求 messages，会触发 Python 3.13 JSON 解析器 "Unterminated string"
+    400 错误，导致整轮对话中断。"""
+    return ToolChunk(content=[TextBlock(text=sanitize_text(text))])
 
 
 def create_opensandbox_tools(adapter: OpenSandboxToolAdapter) -> list:

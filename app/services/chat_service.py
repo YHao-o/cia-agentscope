@@ -23,6 +23,7 @@ from agentscope.credential import OpenAICredential
 from agentscope.model import OpenAIChatModel
 
 from app.config import LLM_INPUT_PROBE_ENABLED, MODEL_CONFIG_PATH, SESSION_FILES_PERSIST_DIR
+from app.services.trace_serial import get_serial, set_serial
 from app.services.file_change_detector import diff, filter_allowed
 from app.services.langfuse_service import LangfuseService, derive_trace_id
 from app.services.round_state import RoundState
@@ -33,7 +34,7 @@ from app.services.sensitive_service import (
     dict_check_sensitive,
 )
 from app.intent.llm_client import chat_complete, extract_json
-from app.utils.event_serialization import sanitize_surrogates
+from app.utils.event_serialization import sanitize_text, sanitize_text_recursive
 from tools.bocha_search_tools import merge_bocha_snapshots
 
 logger = logging.getLogger(__name__)
@@ -114,6 +115,8 @@ async def _probe_llm_input_403(orchestrator_service, text: str) -> bool:
                 temperature=parameters.get("temperature", 0.1),
                 timeout=8.0,
                 extra_body={"chat_template_kwargs": {"enable_thinking": False}},
+                **({"extra_headers": {"app_serial_number": get_serial()}}
+                   if get_serial() else {}),
             )
             return False
         except Exception as e:
@@ -343,13 +346,15 @@ async def _persist_conversation_history(
     try:
         now_str = datetime.now(_BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         user_input = _extract_user_input(messages)
-        # 落库前清洗孤立代理字符：流式 chunk 切开的 emoji 半字符会导致
-        # pymysql UTF-8 编码失败，整轮对话历史（user+assistant）全部丢失
-        user_input = sanitize_surrogates(user_input)
-        final_output = sanitize_surrogates(final_output)
-        citations = sanitize_surrogates(citations)
-        bocha_sum = sanitize_surrogates(bocha_sum)
-        content_parts = sanitize_surrogates(content_parts)
+        # 落库前全链路清洗：孤立代理（流式 emoji 被 chunk 切断）会导致
+        # pymysql UTF-8 编码失败；控制字符（bash 输出的 null/ANSI/二进制片段）
+        # 同样会破坏 MySQL/Redis 序列化。升级为 sanitize_text_recursive，
+        # 两类问题一起兜住，防止整轮对话历史因编码失败丢失
+        user_input = sanitize_text(user_input)
+        final_output = sanitize_text(final_output)
+        citations = sanitize_text_recursive(citations)
+        bocha_sum = sanitize_text_recursive(bocha_sum)
+        content_parts = sanitize_text_recursive(content_parts)
 
         new_messages = []
         if user_input:
@@ -564,28 +569,37 @@ class _PatchedOpenAIChatModel(OpenAIChatModel):
         return (openai.APIError,)
 
     def _call_api(self, model_name, messages, tools=None, tool_choice=None, **kwargs):
-        # 请求出口清洗孤立代理：上下文中残留的孤立代理（如流式输出被
-        # chunk 切半的 emoji）若进入请求体，openai 客户端会转义为
-        # \uXXXX 形式发出，Python 3.13 上游 JSON 解析器对孤立代理转义
-        # 报 "Unterminated string" 并返回 400，整轮对话中断。此处
-        # 原地清洗 Msg.content 与文本块，既保住本轮请求也顺带清理内存
+        # 请求出口全链路清洗：上下文里可能混入 bash 工具输出的控制字符
+        # （\x00 null、\x1b ESC、二进制片段）或流式 chunk 切断的孤立代理。
+        # 这些字符在 Python 3.13 的 JSON 解析器下会触发 "Unterminated string"
+        # 400 错误，导致整轮对话中断——OpenSandbox bash 输出是最常见来源。
+        # 此处原地清洗 Msg.content 与文本块，既保住本轮请求也顺带清理内存
         # 上下文，后续轮次不再复发
+        _total_changed = 0
         try:
             for msg in messages or []:
                 content = getattr(msg, "content", None)
                 if isinstance(content, str):
-                    cleaned = sanitize_surrogates(content)
+                    cleaned = sanitize_text(content)
                     if cleaned != content:
                         msg.content = cleaned
+                        _total_changed += 1
                 elif isinstance(content, list):
                     for block in content:
                         text = getattr(block, "text", None)
                         if isinstance(text, str):
-                            cleaned = sanitize_surrogates(text)
+                            cleaned = sanitize_text(text)
                             if cleaned != text:
                                 block.text = cleaned
+                                _total_changed += 1
         except Exception:
-            logger.debug("[chat_service] 模型请求前代理清洗跳过", exc_info=True)
+            logger.debug("[chat_service] 模型请求前文本清洗跳过", exc_info=True)
+        if _total_changed > 0:
+            logger.info(
+                "[chat_service] _PatchedOpenAIChatModel 清洗 %d 处消息内容 "
+                "(控制字符/代理移除) —— 防止 Python 3.13 JSON 400",
+                _total_changed,
+            )
         return super()._call_api(model_name, messages, tools, tool_choice, **kwargs)
 
 
@@ -595,7 +609,8 @@ def create_model_from_config(model_config: dict, message_pair_id: str = ""):
     被 AgentRegistry 的 create_model_fn 调用，每次返回新实例。
     message_pair_id 非空时通过 client_kwargs 注入请求头
     app_serial_number: OIA-AGENTSCOPE-{message_pair_id}（意图识别/改写/编排
-    走独立 AsyncOpenAI 客户端，不经此路径，天然不带该头）。
+    走独立 AsyncOpenAI 客户端，经 trace_serial ContextVar 在 chat_complete
+    出口注入同一流水号）。
     """
     provider = model_config.get("provider", "openai")
     base_url = model_config.get("base_url", "https://api.deepseek.com/v1")
@@ -790,6 +805,9 @@ async def generate_response(
     before_files: dict = {}
     # 本轮对话配对 id：user/assistant 消息与生成/上传文件共享
     message_pair_id = uuid.uuid4().hex
+    # 设置本轮 trace 流水号：同任务上下文内的意图识别/改写/ReAct/汇总/
+    # 推荐问题/围栏预检等 LLM 调用经 chat_complete 出口统一携带该头
+    set_serial(f"OIA-AGENTSCOPE-{message_pair_id}")
     # 本轮运行时状态（agent_ids / success / token / 消费的上传文件 id）：
     # 每请求独立对象，替代 orchestrator 单例上的 last_* 属性，
     # 并发请求互不覆盖（修复上传文件绑定被竞态清零的问题）
