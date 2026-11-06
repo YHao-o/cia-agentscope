@@ -1,5 +1,6 @@
 import hashlib
 import logging
+import sys
 from contextlib import contextmanager
 from typing import Any, Iterator, Optional
 
@@ -125,16 +126,35 @@ class LangfuseService:
         if not self._enabled or not self._client:
             yield None
             return
+        # 仅兜底 span 的"创建"失败；with 体（yield 处）抛出的业务异常必须
+        # 原样透传——@contextmanager 的生成器在 throw() 后再次 yield 会触发
+        # Python 3.13 的 "generator didn't stop after throw()"，吞掉真实错误
         try:
             kwargs: dict = {"as_type": "span", "name": name, "input": input}
             if trace_id:
                 from langfuse.types import TraceContext
                 kwargs["trace_context"] = TraceContext(trace_id=trace_id)
-            with self._client.start_as_current_observation(**kwargs) as obs:
-                yield obs
+            cm = self._client.start_as_current_observation(**kwargs)
+            obs = cm.__enter__()
         except Exception as e:
             logger.warning("Langfuse start_span failed: %s", e)
             yield None
+            return
+        # 手动驱动 __exit__：含 yield 的异步生成器被外部 aclose()（客户端
+        # 断连/用户停止）时，OTel detach 的 ContextVar token 可能跨
+        # contextvars.Context 失效，抛 ValueError("was created in a
+        # different Context")。span 的 end 先于 detach 完成、数据不丢，
+        # 此处仅吞掉上下文还原失败，保证生成器正常关闭
+        try:
+            yield obs
+        finally:
+            try:
+                cm.__exit__(*sys.exc_info())
+            except ValueError:
+                logger.warning(
+                    "[langfuse_service] span 退出时上下文还原失败"
+                    f"（跨 Context detach，已忽略）name={name}"
+                )
 
     def create_score(
         self,

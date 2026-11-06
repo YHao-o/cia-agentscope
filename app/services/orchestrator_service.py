@@ -36,7 +36,10 @@ from app.intent.llm_client import create_async_client
 from app.orchestrator.parallel import ParallelOrchestrator
 from app.orchestrator.pipeline import PipelineOrchestrator
 from app.orchestrator.react import ReActOrchestrator
-from app.services.chat_service import create_model_from_config
+from app.services.chat_service import (
+    FILE_ONLY_DEFAULT_QUESTION,
+    create_model_from_config,
+)
 from app.services.agent_state_store import (
     load_agent_state,
     persist_agent_state,
@@ -262,6 +265,21 @@ class OrchestratorService:
         return ""
 
     @staticmethod
+    def _has_file_blocks(messages: List[Dict[str, Any]]) -> bool:
+        """最后一条用户消息是否携带文件（data）块——纯文件轮判定。"""
+        for msg in reversed(messages):
+            if msg.get("role") != "user":
+                continue
+            content = msg.get("content")
+            if isinstance(content, list):
+                return any(
+                    isinstance(b, dict) and b.get("type") == "data"
+                    for b in content
+                )
+            return False
+        return False
+
+    @staticmethod
     def _extract_history(messages: List[Dict[str, Any]]) -> List[dict]:
         """从 messages 提取历史对话上下文（排除最后一条，即当前用户输入）。"""
         history = []
@@ -388,11 +406,13 @@ class OrchestratorService:
         knowledge_bases: Optional[List[str]] = None,
         langfuse_service: Optional[Any] = None,
         message_pair_id: Optional[str] = None,
+        session_service: Optional[Any] = None,
+        round_state: Optional[RoundState] = None,
     ) -> tuple:
         """获取/创建工作区并组装注册表与工厂（委托 workspace_assembler）。
 
         本方法会被 run() 放进 asyncio.create_task，
-        因此不得读写请求级状态（应全部经由 RoundState 传递）。
+        请求级状态只通过显式传入的 RoundState 传递，不写服务实例属性。
 
         Returns:
             (registry, agent_factory)
@@ -412,6 +432,8 @@ class OrchestratorService:
             knowledge_bases=knowledge_bases,
             langfuse_service=langfuse_service,
             agent_bound_tools=self._agent_bound_tools,
+            session_service=session_service,
+            round_state=round_state,
         )
 
     def _span(self, langfuse_service: Any, name: str, input_dict: dict) -> Any:
@@ -610,6 +632,7 @@ class OrchestratorService:
         knowledge_bases: Optional[List[str]] = None,
         message_pair_id: Optional[str] = None,
         round_state: Optional[RoundState] = None,
+        input_probe_task: Optional["asyncio.Task"] = None,
     ) -> AsyncGenerator[str, None]:
         """编排主流程：改写 → 识别 → 选择编排器 → 执行。
 
@@ -633,6 +656,9 @@ class OrchestratorService:
                 计数 / 消费的上传文件 id 的载体）；缺省时内部新建。
                 由 generate_response 创建并传入、轮末持久化直接读取——
                 单例服务上不存请求级状态，并发请求互不覆盖
+            input_probe_task: 输入围栏 403 预检任务（与意图链路并行执行），
+                执行智能体前汇合检查；命中时 yield input_llm_403 标记事件
+                交由 chat_service 下发拦截文案。None 时跳过检查
 
         Yields:
             SSE 事件字符串（"data: {...}\n\n" 格式）
@@ -648,10 +674,18 @@ class OrchestratorService:
         rs.input_tokens = 0
         rs.output_tokens = 0
         rs.consumed_upload_ids = []
+        rs.restored_files.clear()
+        rs.completed_files.clear()
 
         if not user_input:
-            yield self._event({"type": "error", "message": "未检测到有效用户输入"})
-            return
+            if self._has_file_blocks(messages):
+                # 纯文件轮：前端只传 data 块（text 为空），补默认提问驱动
+                # 编排；上传文件的解析内容由后续 load_upload_context 按
+                # 会话未绑定文件注入提示词，不依赖 data 块本身
+                user_input = FILE_ONLY_DEFAULT_QUESTION
+            else:
+                yield self._event({"type": "error", "message": "未检测到有效用户输入"})
+                return
 
         # ① 装配请求级配置组件（纯内存；workspace 获取/创建并行化，见下方 ws_task）
         redis_client = None
@@ -695,6 +729,8 @@ class OrchestratorService:
                 knowledge_bases=knowledge_bases or [],
                 langfuse_service=langfuse_service,
                 message_pair_id=message_pair_id,
+                session_service=session_service,
+                round_state=rs,
             ),
             name="workspace-prepare",
         )
@@ -713,6 +749,7 @@ class OrchestratorService:
                 langfuse_service=langfuse_service,
                 request=request,
                 round_state=rs,
+                input_probe_task=input_probe_task,
             ):
                 yield event_str
         finally:
@@ -738,6 +775,7 @@ class OrchestratorService:
         langfuse_service: Optional[Any],
         request: Any = None,
         round_state: RoundState = None,
+        input_probe_task: Optional["asyncio.Task"] = None,
     ) -> AsyncGenerator[str, None]:
         """在等待工作区 task 的同时跑完意图链路，再执行编排。
 
@@ -752,6 +790,10 @@ class OrchestratorService:
             )
             if ws_err:
                 yield self._event({"type": "error", "message": ws_err})
+                return
+            # 输入围栏预检结果汇合（任务已与工作区准备并行执行）
+            if input_probe_task is not None and await input_probe_task:
+                yield self._event({"type": "input_llm_403"})
                 return
             # 等待解析中的上传文件（向前端发 TOOL_CALL 事件对展示等待过程）
             async for ev in wait_for_upload_parsing(request, session_id):
@@ -871,6 +913,13 @@ class OrchestratorService:
             ],
             "relation": intent_result.relation,
         })
+
+        # 输入围栏预检结果汇合：预检任务与意图链路并行执行完毕，命中则
+        # 交由 chat_service 下发拦截文案并结束本轮（不再等待工作区/上传
+        # 文件；沙箱准备任务由 run() 的 finally 收尾）
+        if input_probe_task is not None and await input_probe_task:
+            yield self._event({"type": "input_llm_403"})
+            return
 
         # 编排前汇合：此时意图链路已跑完，工作区大概率已就绪
         registry, agent_factory, ws_err = await self._resolve_workspace_task(

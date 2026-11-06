@@ -26,3 +26,7 @@ class RoundState:
     output_tokens: int = 0
     # 本轮实际消费的上传文件 id（轮末 bind_message_id 精确绑定用）
     consumed_upload_ids: List[int] = field(default_factory=list)
+    # 已恢复历史文件的沙箱签名；未修改的恢复文件不重绑为本轮新产物。
+    restored_files: dict[str, tuple[str, str]] = field(default_factory=dict)
+    # 成功结束的写操作产生的版本，用于用户停止后的保守归档。
+    completed_files: dict[str, tuple[str, str]] = field(default_factory=dict)

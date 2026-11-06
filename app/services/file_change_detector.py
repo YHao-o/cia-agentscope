@@ -14,7 +14,7 @@ ALLOWED_EXTENSIONS: frozenset[str] = frozenset({
     # 图片
     "png", "jpg", "jpeg",
     # 网页与代码
-    "html", "css", "js", "py","json","yml","yaml","bak",
+    "html", "css", "js", "py","json","yml","yaml","sh",
 })
 
 

@@ -294,16 +294,30 @@ class AgentRegistry:
             else ""
         )
 
+        history_guidance = ""
+        if (definition.skills or self._extra_skill_names) and any(
+            getattr(t, "name", None) == "RestoreHistoryFile"
+            for t in self._filter_tools_for_agent(definition, self._all_tools)
+        ):
+            history_guidance = (
+                "\n继续修改本会话以前生成的 PPTX、文档、表格或图片时，先用 ListHistoryFiles"
+                "查询历史文件清单，用精确 path 调用 RestoreHistoryFile，把二进制原件按需加载到"
+                "当前工作区，再使用返回的绝对路径读取或修改。工作区暂未加载旧文件不代表文件已丢失。"
+                "同名文件先按路径和消息配对标识确认；工具报错时如实说明。修改结果另存新文件名，保留旧文件。"
+            )
+
         agent = Agent(
             name=definition.name,
             system_prompt=definition.system_prompt
             + f"\n当前时间：{_get_current_date_str()}。涉及\"今天/本周/最近\"等时间表述时以此为准。"
             + f"\n注意当前工作区目录是/data/workspaces/{session_id}，你只能在该目录下创建/编辑文件，绝不允许修改目录以外的文件！"
+            + "\n用户明确要求不生成文档或附件时，只返回聊天正文，可以使用 Markdown 排版，不创建或导出 .md、.docx 等附件。"
             + "\n用户本轮上传的文件内容会直接附在用户问题里，请直接阅读使用。此外，本会话此前轮次上传文件的解析副本存放在工作目录 uploads/ 下（文件名为 <原文件名>.md）：当用户点名或指代历史文件时，可读取 uploads/ 下对应文件获取内容。"
             + "\n当你生成文件时，生成的文件内容只要用户不做特殊说明应该以中文为主。"
             + "\n当用户要求修改文件时，必须生成新文件名（如添加版本号、时间戳或_modified后缀），严禁直接覆盖原文件，以防止数据丢失。"
             + external_info_guidance
-            + skill_dir_guidance,
+            + skill_dir_guidance
+            + history_guidance,
             model=model,
             toolkit=toolkit,
             state=agent_state,

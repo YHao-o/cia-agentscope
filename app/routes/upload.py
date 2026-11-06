@@ -6,7 +6,11 @@ from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File, 
 
 from app.dependencies import current_user
 from app.services.file_service import FileService
-from app.config import UPLOAD_MAX_SIZE_MB, UPLOAD_ALLOWED_MEDIA_TYPES
+from app.config import (
+    UPLOAD_MAX_SIZE_MB,
+    UPLOAD_AV_MAX_SIZE_MB,
+    UPLOAD_ALLOWED_MEDIA_TYPES,
+)
 from app.models.upload import UploadResponse, UploadErrorResponse
 from app.services.file_parse_service import classify_parse_type, start_background_parse
 
@@ -28,19 +32,24 @@ async def upload_file(
     - 图片/文档/pdf/表格 → MinerU；音频 → 音频转写模型；纯文本直接读取
     - 不再写入沙箱/宿主机工作区：问答时解析内容经提示词注入给 agent
     """
-    # Validate file size
+    # Validate file size：音视频（走转写解析，体积大）单独放宽
     content = await file.read()
-    if not FileService.validate_file_size(content, UPLOAD_MAX_SIZE_MB):
+    media_type = file.content_type or "application/octet-stream"
+    limit_mb = (
+        UPLOAD_AV_MAX_SIZE_MB
+        if media_type.startswith(("audio/", "video/"))
+        else UPLOAD_MAX_SIZE_MB
+    )
+    if not FileService.validate_file_size(content, limit_mb):
         raise HTTPException(
             status_code=413,
             detail=UploadErrorResponse(
                 code=413,
-                msg=f"文件大小超过限制（最大 {UPLOAD_MAX_SIZE_MB}MB）",
+                msg=f"文件大小超过限制（最大 {limit_mb}MB）",
             ).model_dump(),
         )
 
     # Validate media type
-    media_type = file.content_type or "application/octet-stream"
     if not FileService.validate_media_type(media_type, UPLOAD_ALLOWED_MEDIA_TYPES):
         raise HTTPException(
             status_code=415,

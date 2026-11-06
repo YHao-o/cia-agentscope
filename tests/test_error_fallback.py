@@ -58,6 +58,12 @@ def _make_orch(events):
     orch._input_probe_model_cfg = None
 
     async def fake_run(*args, **kwargs):
+        # 对齐真实编排层契约：执行智能体前汇合输入围栏预检结果，
+        # 命中时 yield input_llm_403 标记（chat_service 据此下发拦截文案）
+        probe = kwargs.get("input_probe_task")
+        if probe is not None and await probe:
+            yield 'data: {"type": "input_llm_403"}\n\n'
+            return
         for ev in events:
             yield ev
 
@@ -123,6 +129,9 @@ async def _run_generate(monkeypatch, events, upload_dao=None, orch=None):
 
     if orch is None:
         orch = _make_orch(events)
+    else:
+        # Keep the supplied probe client while streaming this test's business events.
+        orch.run = _make_orch(events).run
     session_service = _make_session_service()
     raw = await _collect(generate_response(
         orchestrator_service=orch,
@@ -330,9 +339,10 @@ async def test_input_probe_403_blocks_before_orchestration(monkeypatch):
     summaries = [e for e in events if e.get("type") == "summary"]
     assert len(summaries) == 1
     assert summaries[0]["content"] == SENSITIVE_BLOCK_MESSAGE
-    # 最后一条：files_generated，空文件列表 + message_pair_id
-    assert types[-1] == "files_generated"
-    files_ev = events[-1]
+    # 最后一条业务事件：files_generated；trace_ready 随后由 finalize 发出。
+    business_events = [e for e in events if e.get("type") != "trace_ready"]
+    assert business_events[-1]["type"] == "files_generated"
+    files_ev = business_events[-1]
     assert files_ev["files"] == []
     assert files_ev["message_pair_id"]
     # 输入拦截不再使用 message_replace（输出阶段拦截保留该语义）

@@ -7,7 +7,9 @@
 
 多智能体编排的核心逻辑下沉到 app.services.orchestrator_service。
 """
+import io
 import json
+import zipfile
 import logging
 import os
 import asyncio
@@ -68,6 +70,10 @@ def _compute_ttft_marker(event_type: str) -> bool:
 
 # 编排链路 error 事件的统一前端兜底文案（原始错误信息只进日志）
 _FRIENDLY_ERROR_MESSAGE = "抱歉，暂时无法生成回复。请重试并联系管理员"
+
+# 纯文件轮默认提问：前端只传 data 块（text 为空）时编排层用它驱动本轮
+# （仅作为 LLM 输入，不落库——历史里用户消息保持空文本"只发了文件"）
+FILE_ONLY_DEFAULT_QUESTION = "请解析并分析我上传的文件。"
 
 # 大模型 403 判定：推理引擎安全拦截时以 HTTP 状态码或业务 code 返回 403，
 # 错误信息会内嵌在异常文本里（如 "Error code: 403 - ..."）。按词边界匹配，
@@ -346,6 +352,14 @@ async def _persist_conversation_history(
     try:
         now_str = datetime.now(_BEIJING_TZ).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
         user_input = _extract_user_input(messages)
+        # 纯文件轮：前端只传 data 块（text 为空），本轮消费了上传文件——
+        # 仍落一条空文本 user 消息（前端按 message_pair_id 挂上传文件、
+        # 渲染为"只发了文件"），保证轮末 bind_message_id 拿到
+        # user_message_id 完成绑定（否则文件 message_id 恒为 NULL，
+        # 前端历史无归属消息、文件不显示）
+        file_only_round = bool(
+            round_state and round_state.consumed_upload_ids
+        ) and not user_input
         # 落库前全链路清洗：孤立代理（流式 emoji 被 chunk 切断）会导致
         # pymysql UTF-8 编码失败；控制字符（bash 输出的 null/ANSI/二进制片段）
         # 同样会破坏 MySQL/Redis 序列化。升级为 sanitize_text_recursive，
@@ -357,7 +371,7 @@ async def _persist_conversation_history(
         content_parts = sanitize_text_recursive(content_parts)
 
         new_messages = []
-        if user_input:
+        if user_input or file_only_round:
             new_messages.append({
                 "role": "user", "content": user_input, "timestamp": now_str,
                 "agent_ids": [],
@@ -432,11 +446,16 @@ def _persist_file_bytes(persist_dir: str, session_id: str, rel_path: str, conten
 
     保留 rel_path 的子目录结构；任何异常记 warning 并返回 False（调用方回退沙箱 url）。
     """
+    temporary = None
     try:
         full_path = os.path.join(persist_dir, session_id, rel_path)
         os.makedirs(os.path.dirname(full_path), exist_ok=True)
-        with open(full_path, "wb") as f:
+        candidate = os.path.join(os.path.dirname(full_path), f".archive-{uuid.uuid4().hex}")
+        with open(candidate, "xb") as f:
+            temporary = candidate
             f.write(content)
+        os.replace(temporary, full_path)
+        temporary = None
         return True
     except Exception:
         logger.warning(
@@ -444,6 +463,32 @@ def _persist_file_bytes(persist_dir: str, session_id: str, rel_path: str, conten
             session_id, rel_path, exc_info=True,
         )
         return False
+    finally:
+        if temporary:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                logger.warning("[chat_service] 清理持久化临时文件失败", exc_info=True)
+
+
+def _finished_artifact(path: str, data: bytes) -> bool:
+    """Reject truncated common document containers during interrupted-round recovery."""
+    suffix = os.path.splitext(path)[1].lower()
+    main = {".pptx": "ppt/presentation.xml", ".docx": "word/document.xml",
+            ".xlsx": "xl/workbook.xml"}.get(suffix)
+    if main:
+        try:
+            with zipfile.ZipFile(io.BytesIO(data)) as archive:
+                return all(archive.getinfo(name).file_size > 0 for name in ("[Content_Types].xml", main))
+        except (KeyError, ValueError, zipfile.BadZipFile):
+            return False
+    if suffix == ".pdf":
+        return data.startswith(b"%PDF-") and data.rstrip().endswith(b"%%EOF")
+    if suffix == ".png":
+        return data.startswith(b"\x89PNG\r\n\x1a\n") and data.endswith(b"IEND\xaeB`\x82")
+    if suffix in (".jpg", ".jpeg"):
+        return data.startswith(b"\xff\xd8") and data.endswith(b"\xff\xd9")
+    return bool(data)
 
 
 async def _detect_and_emit_files(
@@ -454,6 +499,8 @@ async def _detect_and_emit_files(
     user_id: str = "",
     message_pair_id: Optional[str] = None,
     assistant_message_id: Optional[int] = None,
+    restored_files: Optional[dict] = None,
+    completed_files: Optional[dict] = None,
 ) -> AsyncGenerator[str, None]:
     """检测本轮新文件并 yield files_generated 事件，随后持久化文件元信息。
 
@@ -469,12 +516,24 @@ async def _detect_and_emit_files(
     try:
         if workspace_manager is not None and session_id:
             after_files = await workspace_manager.list_session_files(user_id, session_id)
+            # 按需加载的旧产物不是本轮新产物。与恢复时签名一致时忽略，
+            # 若随后被编辑则签名改变，仍进入现有变更检测和持久化链路。
+            if restored_files:
+                if isinstance(before_files, dict):
+                    before_files = {**before_files, **restored_files}
+                else:
+                    before_files = set(before_files) | set(restored_files)
             # 白名单过滤：常规文档/表格/演示/图片及指定代码文件下发前端并落库，
             # svg/log 等过程文件不进入 files_generated 事件与 session_files
             new_files = filter_allowed(
                 diff(before_files, after_files, exclude_prefixes=("uploads/",))
             )
             for rel_path in new_files:
+                if completed_files is not None and (
+                    not SESSION_FILES_PERSIST_DIR or rel_path not in completed_files
+                    or completed_files[rel_path] != after_files[rel_path]
+                ):
+                    continue
                 size = await workspace_manager.stat_session_file(user_id, session_id, rel_path)
                 if size is None:
                     continue
@@ -486,10 +545,20 @@ async def _detect_and_emit_files(
                     content = await workspace_manager.read_session_file(
                         user_id, session_id, rel_path
                     )
+                    if completed_files is not None:
+                        signature = completed_files[rel_path]
+                        if (content is None or str(len(content)) != signature[1]
+                                or len(content) != size or not _finished_artifact(rel_path, content)):
+                            continue
+                        verified = await workspace_manager.list_session_files(user_id, session_id)
+                        if verified.get(rel_path) != signature:
+                            continue
                     if content is not None and _persist_file_bytes(
                         SESSION_FILES_PERSIST_DIR, session_id, rel_path, content
                     ):
                         url = f"/persist-files/{session_id}/{rel_path}"
+                    elif completed_files is not None:
+                        continue
                 files_payload.append({
                     "name": os.path.basename(rel_path),
                     "path": rel_path,
@@ -501,7 +570,7 @@ async def _detect_and_emit_files(
                 })
     except Exception:
         logger.warning("[chat_service] 检测新文件失败", exc_info=True)
-    yield f"data: {json.dumps({'type': 'files_generated', 'files': files_payload, 'message_pair_id':message_pair_id}, ensure_ascii=False)}\n\n"
+
 
     # 持久化本轮生成的文件元信息（供 /sessions/{session_id} 回看）
     if files_payload and session_service and session_id:
@@ -509,6 +578,10 @@ async def _detect_and_emit_files(
             await session_service.append_session_files(session_id, files_payload)
         except Exception:
             logger.warning("[chat_service] 持久化生成文件元信息失败", exc_info=True)
+            if completed_files is not None:
+                files_payload = []
+    yield f"data: {json.dumps({'type': 'files_generated', 'files': files_payload, 'message_pair_id':message_pair_id}, ensure_ascii=False)}\n\n"
+
 
 
 async def _finalize_trace(
@@ -812,6 +885,37 @@ async def generate_response(
     # 每请求独立对象，替代 orchestrator 单例上的 last_* 属性，
     # 并发请求互不覆盖（修复上传文件绑定被竞态清零的问题）
     round_state = RoundState()
+    history_task = None
+    archive_task = None
+    files_emitted = False
+
+    async def persist_history():
+        return await _persist_conversation_history(
+            session_service, session_id, user_id,
+            messages, final_output,
+            upload_file_dao=getattr(
+                request.app.state, "upload_file_dao", None
+            ) if request is not None else None,
+            message_pair_id=message_pair_id,
+            citations=collected_citations,
+            bocha_sum=collected_bocha_sum,
+            content_parts=collected_content_parts,
+            round_state=round_state,
+        )
+
+    async def archive_files(persist_ids, completed_files=None):
+        return [ev async for ev in _detect_and_emit_files(
+            session_id, before_files, session_service,
+            workspace_manager=workspace_manager,
+            user_id=user_id or "",
+            message_pair_id=message_pair_id,
+            assistant_message_id=(persist_ids or {}).get("assistant_message_id"),
+            restored_files=round_state.restored_files,
+            completed_files=completed_files,
+        )]
+
+    # 输入围栏 403 预检任务（③.6 创建，与意图链路并行；None = 尚未创建）
+    probe_task: Optional[asyncio.Task] = None
     if session_id:
         try:
             if workspace_manager is not None:
@@ -895,36 +999,16 @@ async def generate_response(
                 )
                 return
 
-            # ③.6 输入围栏（大模型 403 预检）：将用户输入直发业务模型做最小
-            # 探测（max_tokens=1），推理引擎内容安全拦截（403）时立即以敏感
-            # 文案结束本轮——避免进入编排后才在生成阶段被拦，浪费意图识别、
-            # 工具调用等轮次。非 403 异常（超时/网络/5xx）一律放行，
-            # 由 error 事件层的 403 替换兜底。
-            if await _probe_llm_input_403(
-                orchestrator_service, _extract_user_input(messages)
-            ):
-                for ev in _block_stream_events(
-                    SENSITIVE_BLOCK_MESSAGE, message_pair_id
-                ):
-                    yield ev
-                _safe_update_span(root_obs, {
-                    "reply": "",
-                    "session_id": session_id,
-                    "user_id": user_id,
-                    "sensitiveBlocked": True,
-                    "blockedStage": "input-llm-403",
-                })
-                # 拦截轮同样落库（与词典命中路径一致）
-                await _persist_conversation_history(
-                    session_service, session_id, user_id,
-                    messages, SENSITIVE_BLOCK_MESSAGE,
-                    upload_file_dao=getattr(
-                        request.app.state, "upload_file_dao", None
-                    ) if request is not None else None,
-                    message_pair_id=message_pair_id,
-                    round_state=round_state,
+            # ③.6 输入围栏（大模型 403 预检）：探测任务与意图链路（改写/
+            # 识别/编排决策）并行执行，编排层在执行智能体前汇合检查
+            # （事件 input_llm_403），命中时本层下发拦截文案并结束本轮
+            # ——预检不再串行阻塞首屏。非 403 异常（超时/网络/5xx）一律
+            # 放行，由 error 事件层的 403 替换兜底。
+            probe_task = asyncio.create_task(
+                _probe_llm_input_403(
+                    orchestrator_service, _extract_user_input(messages)
                 )
-                return
+            )
 
             # ④ 执行编排主流程，实时透传 SSE 事件
             async for event_str in orchestrator_service.run(
@@ -940,6 +1024,7 @@ async def generate_response(
                 langfuse_service=langfuse_service,
                 message_pair_id=message_pair_id,
                 round_state=round_state,
+                input_probe_task=probe_task,
             ):
                 # 取消检查点：每个事件之间检测一次（LLM chunk 之间会回到本循环）
                 if await _cancelled():
@@ -956,6 +1041,31 @@ async def generate_response(
                         payload = None
                 event_type = payload.get("type", "") if payload else ""
 
+                if event_type == "input_llm_403":
+                    # 输入围栏命中（预检与意图链路并行执行，编排层汇合检查
+                    # 后以该标记事件交回本层）：下发标准拦截事件序列并落库
+                    # 后结束本轮，与词典命中路径同构
+                    for ev in _block_stream_events(
+                        SENSITIVE_BLOCK_MESSAGE, message_pair_id
+                    ):
+                        yield ev
+                    _safe_update_span(root_obs, {
+                        "reply": "",
+                        "session_id": session_id,
+                        "user_id": user_id,
+                        "sensitiveBlocked": True,
+                        "blockedStage": "input-llm-403",
+                    })
+                    await _persist_conversation_history(
+                        session_service, session_id, user_id,
+                        messages, SENSITIVE_BLOCK_MESSAGE,
+                        upload_file_dao=getattr(
+                            request.app.state, "upload_file_dao", None
+                        ) if request is not None else None,
+                        message_pair_id=message_pair_id,
+                        round_state=round_state,
+                    )
+                    return
                 if event_type == "error":
                     error_occurred = True
                     original_error = str(payload.get("message", ""))
@@ -1116,27 +1226,11 @@ async def generate_response(
                     yield ev
 
             # ⑥ 持久化对话历史（用户输入 + 智能体输出）+ 回填上传文件 message_id
-            persist_ids = await _persist_conversation_history(
-                session_service, session_id, user_id,
-                messages, final_output,
-                upload_file_dao=getattr(
-                    request.app.state, "upload_file_dao", None
-                ) if request is not None else None,
-                message_pair_id=message_pair_id,
-                citations=collected_citations,
-                bocha_sum=collected_bocha_sum,
-                content_parts=collected_content_parts,
-                round_state=round_state,
-            )
-
-            # ⑦ 检测本轮新文件
-            async for ev in _detect_and_emit_files(
-                session_id, before_files, session_service,
-                workspace_manager=workspace_manager,
-                user_id=user_id or "",
-                message_pair_id=message_pair_id,
-                assistant_message_id=(persist_ids or {}).get("assistant_message_id"),
-            ):
+            history_task = asyncio.create_task(persist_history())
+            persist_ids = await asyncio.shield(history_task)
+            archive_task = asyncio.create_task(archive_files(persist_ids))
+            for ev in await asyncio.shield(archive_task):
+                files_emitted = True
                 yield ev
 
             # 更新根 span 输出（context manager 退出时自动 end）
@@ -1157,32 +1251,63 @@ async def generate_response(
             aborted_at_ms = int((time.perf_counter() - t0) * 1000)
         logger.info(f"[chat_service] 会话被用户中断 session={session_id}")
     finally:
+        # 输入围栏预检任务收尾：编排层已消费的会先完成；未完成的取消，
+        # 已完成未取消的取出异常，避免 "Task exception was never retrieved"
+        if probe_task is not None:
+            if not probe_task.done():
+                probe_task.cancel()
+            elif not probe_task.cancelled():
+                probe_task.exception()
+
         # 中断时也落库：success 强制 False（round_state 为每请求独立对象，
         # 但中断轮答案被截断，语义上应为失败，仍补 UPDATE 强制标记）
         if aborted:
-            if not final_output:
-                final_output = "\n".join(p for p in final_fallback_parts if p).strip()
-            await _persist_conversation_history(
-                session_service, session_id, user_id,
-                messages, final_output,
-                # 中断轮同样回填上传文件 message_id：本轮已注入消费的文件
-                # 若不绑定，下一轮会与新上传文件一起重复注入
-                # （用户可见症状：后一次提问用的是前一个文件）
-                upload_file_dao=getattr(
-                    request.app.state, "upload_file_dao", None
-                ) if request is not None else None,
-                message_pair_id=message_pair_id,
-                citations=collected_citations,
-                bocha_sum=collected_bocha_sum,
-                content_parts=collected_content_parts,
-                round_state=round_state,
-            )
-            # 中断轮答案被截断，语义上应为失败：补 UPDATE 强制标记
-            if session_service and session_id and user_id:
+            async def finalize_stopped_round():
+                nonlocal history_task, final_output
+                if not final_output:
+                    final_output = "\n".join(p for p in final_fallback_parts if p).strip()
+                if not final_output and round_state.completed_files:
+                    final_output = "已停止生成。"
+                round_state.success = False
+                if history_task is None:
+                    history_task = asyncio.create_task(persist_history())
+                ids = await history_task
+                # Redis 租约丢失也会触发取消：旧持有者不得归档新一轮的工作区。
+                from app.services.chat_runtime import current_chat_run
+                from app.services.redis_lease import decode
+                owner = current_chat_run.get()
+                if redis_client is not None and owner is not None:
+                    try:
+                        token = decode(await asyncio.wait_for(redis_client.get(f"chat_run:{session_id}"), timeout=5))
+                    except Exception:
+                        logger.warning("[chat_service] 中断归档无法确认会话租约", exc_info=True)
+                        return []
+                    if owner != (session_id, token):
+                        return []
+                if (ids or {}).get("assistant_message_id") and session_service:
+                    try:
+                        await session_service.mark_last_assistant_failed(session_id, user_id)
+                    except Exception:
+                        logger.warning("[chat_service] 标记中断消息失败状态失败", exc_info=True)
+                if files_emitted:
+                    return []
+                if archive_task is not None:
+                    return await archive_task
+                if not (ids or {}).get("assistant_message_id") or not round_state.completed_files:
+                    return []
+
+                return await archive_files(ids, round_state.completed_files.copy())
+
+            # 本地检查点和路由 watcher 可能先后收到同一次停止。等待同一个收尾任务，
+            # 避免第二次取消把“已保存消息”与“归档文件”截断在两步之间。
+            finishing = asyncio.create_task(finalize_stopped_round())
+            while not finishing.done():
                 try:
-                    await session_service.mark_last_assistant_failed(session_id, user_id)
-                except Exception:
-                    logger.warning("[chat_service] 标记中断消息失败状态失败", exc_info=True)
+                    await asyncio.shield(finishing)
+                except asyncio.CancelledError:
+                    continue
+            for ev in finishing.result():
+                yield ev
 
         # ⑧ trace 收尾（保证 span 已 end + flush）
         async for ev in _finalize_trace(

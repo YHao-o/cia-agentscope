@@ -68,11 +68,13 @@ async def assemble_workspace_components(
     knowledge_bases: Optional[List[str]] = None,
     langfuse_service: Optional[Any] = None,
     agent_bound_tools: Optional[dict] = None,
+    session_service: Optional[Any] = None,
+    round_state: Optional[Any] = None,
 ) -> tuple:
     """获取/创建工作区并组装注册表与工厂（依赖沙箱，可与意图链路并行）。
 
     含 workspace-load 环节埋点。本函数会被 run() 放进 asyncio.create_task，
-    因此不得读写请求级状态（_last_agent_ids / _last_success 等）。
+    请求级恢复签名通过显式传入的 round_state 记录，不写全局状态。
 
     Returns:
         (registry, agent_factory)
@@ -165,11 +167,32 @@ async def assemble_workspace_components(
                 f"stderr={result['stderr']}"
             )
 
-    md_tools = create_md_export_tools(_sandbox_read_file, _sandbox_write_file)
+    from app.config import SESSION_FILES_PERSIST_DIR
+    from app.services.sandbox_file_checkpoint import SandboxFileCheckpoint
+
+    checkpoint = None
+    if SESSION_FILES_PERSIST_DIR and round_state is not None and session_service is not None:
+        checkpoint = SandboxFileCheckpoint(adapter.artifact_signatures, round_state.completed_files)
+
+    async def write_export(rel_path: str, data: bytes) -> None:
+        if checkpoint is None:
+            await _sandbox_write_file(rel_path, data)
+        else:
+            await checkpoint.run(_sandbox_write_file, rel_path, data)
+
+    md_tools = create_md_export_tools(_sandbox_read_file, write_export)
     all_tools = (
-        create_opensandbox_tools(adapter) + _chart_tools
+        create_opensandbox_tools(adapter, checkpoint) + _chart_tools
         + [policy_qa_tool, feedback_tool] + md_tools
     )
+    if session_service is not None and user_id and session_id_safe:
+        from app.services.historical_file_service import HistoricalFileService
+        from tools.history_file_tools import create_history_file_tools
+        history_service = HistoricalFileService(
+            session_service, adapter, user_id, session_id_safe, SESSION_FILES_PERSIST_DIR,
+            restored_files=round_state.restored_files if round_state is not None else None,
+        )
+        all_tools.extend(create_history_file_tools(history_service))
     # 联网搜索工具受请求开关控制：关闭时不注入
     # （Toolkit 的 tools 对所有 agent 全局可见，需与技能过滤同步收口）
     if search_enabled:

@@ -41,8 +41,9 @@ MYSQL_USER = os.getenv("MYSQL_USER", "root")
 MYSQL_PASSWORD = _resolve_secret(os.getenv("MYSQL_PASSWORD", ""), _CONFIG_KEY)
 MYSQL_DATABASE = os.getenv("MYSQL_DATABASE", "agentscope")
 
-# 文件上传配置
-UPLOAD_MAX_SIZE_MB = int(os.getenv("UPLOAD_MAX_SIZE_MB", "10"))
+# 文件上传配置：普通文件默认 20MB；音频/视频单独放宽（默认 200MB）
+UPLOAD_MAX_SIZE_MB = int(os.getenv("UPLOAD_MAX_SIZE_MB", "20"))
+UPLOAD_AV_MAX_SIZE_MB = int(os.getenv("UPLOAD_AV_MAX_SIZE_MB", "200"))
 # 上传文件解析统一超时（秒）：MinerU 轮询与音频转写共用
 UPLOAD_PARSE_TIMEOUT = int(os.getenv("UPLOAD_PARSE_TIMEOUT", "60"))
 UPLOAD_ALLOWED_MEDIA_TYPES = [
