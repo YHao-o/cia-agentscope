@@ -103,6 +103,7 @@ def _make_session_service():
     svc.save_latest_trace_id = AsyncMock()
     svc.append_session_files = AsyncMock()
     svc.mark_last_assistant_failed = AsyncMock()
+    svc.save_agent_state = AsyncMock()
     return svc
 
 
@@ -454,3 +455,57 @@ async def test_bocha_sum_empty_when_no_events(monkeypatch):
     persisted = session_service.append_messages.await_args[0][2]
     asst_msg = next(m for m in persisted if m["role"] == "assistant")
     assert asst_msg["bocha_sum"] is None
+
+
+# ---------------------------------------------------------------------------
+# 输出敏感命中：持久化脱敏（P1-4）
+# ---------------------------------------------------------------------------
+
+_BLOCKED_SENS = {
+    "blocked": True, "reason": "命中敏感词", "hit_sources": ["local"],
+    "sensitive_words": ["敏感词"], "source": "server", "raw": {},
+}
+
+
+@pytest.mark.asyncio
+async def test_output_sensitive_blocked_persists_sanitized(monkeypatch):
+    """输出敏感命中 → message_replace 下发拦截文案，落库内容同步脱敏
+    （原文不得进入历史，避免历史回显二次泄露）。"""
+    _patch_recommended_questions(monkeypatch)
+
+    async def fake_dict(text, stage="input"):
+        return dict(_SAFE_SENS)
+
+    async def fake_check(text, stage="output"):
+        return dict(_BLOCKED_SENS)
+
+    monkeypatch.setattr(chat_service_module, "dict_check_sensitive", fake_dict)
+    monkeypatch.setattr(chat_service_module, "check_sensitive", fake_check)
+
+    session_service = _make_session_service()
+    raw = await _collect(generate_response(
+        orchestrator_service=_make_orch([
+            'data: {"type": "TEXT_BLOCK_DELTA", "delta": "敏感内容片段"}\n\n',
+            'data: {"type": "summary", "content": "包含敏感词的完整回答"}\n\n',
+        ]),
+        messages=[{"role": "user", "content": "问题"}],
+        session_id="sess-1",
+        user_id="u1",
+        session_service=session_service,
+        langfuse_service=None,
+        request=_make_request(upload_dao=None),
+    ))
+    events = _parse_events(raw)
+
+    # message_replace 事件下发（前端替换展示），且跳过推荐问题
+    replaces = [e for e in events if e.get("type") == "message_replace"]
+    assert len(replaces) == 1
+    assert replaces[0]["message"] == SENSITIVE_BLOCK_MESSAGE
+    assert not any(e.get("type") == "recommended_questions" for e in events)
+
+    # 落库：assistant 内容为拦截文案，原文不进历史
+    session_service.append_messages.assert_awaited_once()
+    persisted = session_service.append_messages.await_args[0][2]
+    asst_msg = next(m for m in persisted if m["role"] == "assistant")
+    assert asst_msg["content"] == SENSITIVE_BLOCK_MESSAGE
+    assert "包含敏感词的完整回答" not in json.dumps(persisted, ensure_ascii=False)

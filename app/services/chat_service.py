@@ -28,6 +28,7 @@ from app.config import LLM_INPUT_PROBE_ENABLED, MODEL_CONFIG_PATH, SESSION_FILES
 from app.services.trace_serial import get_serial, set_serial
 from app.services.file_change_detector import diff, filter_allowed
 from app.services.langfuse_service import LangfuseService, derive_trace_id
+from app.services.agent_state_store import persist_agent_state
 from app.services.round_state import RoundState
 from app.services.sensitive_service import (
     SENSITIVE_BLOCK_MESSAGE,
@@ -370,6 +371,8 @@ async def _persist_conversation_history(
         bocha_sum = sanitize_text_recursive(bocha_sum)
         content_parts = sanitize_text_recursive(content_parts)
 
+        # tokens 口径：user 行 = 本地文本估算（非接口值）；assistant 行 = 本轮
+        # 所有模型调用 input+output 之和（真实 usage）；表内不区分输入/输出。
         new_messages = []
         if user_input or file_only_round:
             new_messages.append({
@@ -387,7 +390,8 @@ async def _persist_conversation_history(
             )
             # 取本轮编排是否成功（基于 TaskResult.success，异常/超时/失败为 False）
             last_success = round_state.success if round_state else True
-            # 真实 token 消耗：MODEL_CALL_END 事件累积的 input+output 之和；
+            # 真实 token 消耗：MODEL_CALL_END 事件累积的 input+output 之和
+            # （表内不区分输入/输出）；
             # 为 0（如自有 LLM 链路未发事件、异常降级）时回退文本估算
             real_tokens = (
                 (int(round_state.input_tokens or 0) + int(round_state.output_tokens or 0))
@@ -449,6 +453,19 @@ def _persist_file_bytes(persist_dir: str, session_id: str, rel_path: str, conten
     temporary = None
     try:
         full_path = os.path.join(persist_dir, session_id, rel_path)
+        # 防御纵深：不依赖入口校验，最终路径必须同时落在归档根目录
+        # 与当前会话目录内（防 session_id 与 rel_path 双向穿越）
+        root = os.path.realpath(os.path.abspath(persist_dir))
+        session_root = os.path.join(root, session_id)
+        resolved = os.path.realpath(full_path)
+        if not (
+            resolved.startswith(root + os.sep)
+            and resolved.startswith(session_root + os.sep)
+        ):
+            logger.warning(
+                "[chat_service] 归档路径越界拒绝 session=%s rel=%s", session_id, rel_path,
+            )
+            return False
         os.makedirs(os.path.dirname(full_path), exist_ok=True)
         candidate = os.path.join(os.path.dirname(full_path), f".archive-{uuid.uuid4().hex}")
         with open(candidate, "xb") as f:
@@ -860,6 +877,7 @@ async def generate_response(
     text_delta_seen = False
     # 本轮编排流是否出现过 error 事件（前端文案兜底 + 落库兜底的触发标志）
     error_occurred = False
+    model_blocked = False
     # error 事件实际下发给前端的文案（403 → 敏感提示，其余 → 通用兜底）；
     # 无输出轮落库时复用，保证会话历史与前端所见一致
     chosen_error_message = _FRIENDLY_ERROR_MESSAGE
@@ -1077,6 +1095,7 @@ async def generate_response(
                     # chosen_error_message 供无输出轮的落库兜底复用，保证
                     # 前端所见与会话历史记录一致
                     if _is_llm_403_error(original_error):
+                        model_blocked = True
                         chosen_error_message = SENSITIVE_BLOCK_MESSAGE
                     else:
                         chosen_error_message = _FRIENDLY_ERROR_MESSAGE
@@ -1123,6 +1142,7 @@ async def generate_response(
                     if event_type == "pipeline_intercept" and _is_llm_403_error(
                         str(payload.get("message", ""))
                     ):
+                        model_blocked = True
                         payload["message"] = SENSITIVE_BLOCK_MESSAGE
                         event_str = (
                             "data: "
@@ -1215,8 +1235,23 @@ async def generate_response(
                 sens_result = await check_sensitive(final_output, stage="output")
                 if sens_result["blocked"]:
                     output_blocked = True
+                    final_output = SENSITIVE_BLOCK_MESSAGE
+                    collected_content_parts = [{
+                        "type": "text",
+                        "content": SENSITIVE_BLOCK_MESSAGE,
+                    }]
                     replace_event = build_message_replace_event(sens_result, stage="output")
                     yield f"data: {json.dumps(replace_event, ensure_ascii=False)}\n\n"
+
+                elif not model_blocked and sens_result.get("source") != "client-fallback":
+                    # 检测过程中可能收到停止信号。上轮状态一直保留到本轮放行。
+                    if await _cancelled():
+                        aborted = True
+                        aborted_at_ms = int((time.perf_counter() - t0) * 1000)
+                        raise asyncio.CancelledError()
+                    for aid, snapshot in round_state.final_states.items():
+                        await persist_agent_state(session_service, session_id, user_id, aid, snapshot)
+            round_state.final_states.clear()
 
             # ⑤ 编排流结束立即生成推荐问题（前置，让前端尽快拿到）
             if not output_blocked:
@@ -1251,6 +1286,7 @@ async def generate_response(
             aborted_at_ms = int((time.perf_counter() - t0) * 1000)
         logger.info(f"[chat_service] 会话被用户中断 session={session_id}")
     finally:
+        round_state.final_states.clear()
         # 输入围栏预检任务收尾：编排层已消费的会先完成；未完成的取消，
         # 已完成未取消的取出异常，避免 "Task exception was never retrieved"
         if probe_task is not None:

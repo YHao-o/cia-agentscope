@@ -1,13 +1,44 @@
 """auth_service token 安全测试：refresh token 不得作为接口访问凭证。"""
+import os
+import runpy
+import secrets
+
 import jwt
 import pytest
 
+import app.config as config
 from app.services.auth_service import (
     create_access_token,
     create_refresh_token,
     decode_access_token,
     decode_refresh_token,
 )
+from app.utils.secret_codec import encrypt
+
+
+@pytest.mark.parametrize("value", [None, "", "  ", "please-change-this-secret"])
+def test_rejects_unconfigured_signing_key(monkeypatch, value):
+    monkeypatch.setattr("dotenv.load_dotenv", lambda: None)
+    monkeypatch.delenv("JWT_SECRET", raising=False)
+    if value is not None:
+        monkeypatch.setenv("JWT_SECRET", value)
+    with pytest.raises(RuntimeError, match="JWT_SECRET"):
+        runpy.run_path(config.__file__)
+
+
+def test_signing_key_validated_after_decryption(monkeypatch):
+    monkeypatch.setattr("dotenv.load_dotenv", lambda: None)
+    key = os.urandom(16)
+    monkeypatch.setenv("CONFIG_DECRYPT_KEY", key.hex())
+    monkeypatch.setenv("MYSQL_PASSWORD", "")
+    for value in ("please-change-this-secret", secrets.token_hex(32)):
+        monkeypatch.setenv("JWT_SECRET", f"ENC({encrypt(value, key)})")
+        if value == "please-change-this-secret":
+            with pytest.raises(RuntimeError, match="JWT_SECRET"):
+                runpy.run_path(config.__file__)
+        else:
+            assert runpy.run_path(config.__file__)["JWT_SECRET"] == value
+
 
 
 def test_access_token_decodes_normally():

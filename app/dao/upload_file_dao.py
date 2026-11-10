@@ -12,6 +12,12 @@ import aiomysql
 
 logger = logging.getLogger(__name__)
 
+# 会话属主以已登记的 sessions 为准，隔离历史遗留的异属主附件。
+_OWNER_SCOPE = (
+    "AND user_id = (SELECT s.user_id FROM sessions s "
+    "WHERE s.session_id = upload_files.session_id AND s.deleted_at IS NULL) "
+)
+
 
 class UploadFileDAO:
     """上传文件数据访问层"""
@@ -87,7 +93,7 @@ class UploadFileDAO:
             async with conn.cursor(aiomysql.DictCursor) as cur:
                 await cur.execute(
                     "SELECT id, filename, parsed_content FROM upload_files "
-                    "WHERE session_id = %s AND message_id IS NULL "
+                    "WHERE session_id = %s " + _OWNER_SCOPE + "AND message_id IS NULL "
                     "AND parsed_content IS NOT NULL AND parsed_content != '' "
                     "ORDER BY id",
                     (session_id,),
@@ -107,7 +113,7 @@ class UploadFileDAO:
             async with conn.cursor(aiomysql.DictCursor) as cur:
                 await cur.execute(
                     "SELECT filename, status, message_id FROM upload_files "
-                    "WHERE session_id = %s ORDER BY id ASC",
+                    "WHERE session_id = %s " + _OWNER_SCOPE + "ORDER BY id ASC",
                     (session_id,),
                 )
                 rows = await cur.fetchall()
@@ -124,7 +130,7 @@ class UploadFileDAO:
             async with conn.cursor(aiomysql.DictCursor) as cur:
                 await cur.execute(
                     "SELECT filename, parse_type FROM upload_files "
-                    "WHERE session_id = %s AND message_id IS NULL "
+                    "WHERE session_id = %s " + _OWNER_SCOPE + "AND message_id IS NULL "
                     "AND status IN ('pending', 'parsing') "
                     "ORDER BY id",
                     (session_id,),
@@ -140,7 +146,7 @@ class UploadFileDAO:
                 await cur.execute(
                     "SELECT filename, parsed_content, message_id "
                     "FROM upload_files "
-                    "WHERE session_id = %s "
+                    "WHERE session_id = %s " + _OWNER_SCOPE +
                     "AND parsed_content IS NOT NULL AND parsed_content != '' "
                     "ORDER BY id",
                     (session_id,),
@@ -172,7 +178,7 @@ class UploadFileDAO:
                     f"UPDATE upload_files "
                     f"SET message_id = %s, message_pair_id = %s, "
                     f"updated_at = NOW() "
-                    f"WHERE session_id = %s AND message_id IS NULL "
+                    "WHERE session_id = %s " + _OWNER_SCOPE + "AND message_id IS NULL "
                     f"AND id IN ({placeholders})",
                     (message_id, message_pair_id, session_id, *file_ids),
                 )
@@ -190,7 +196,7 @@ class UploadFileDAO:
             async with conn.cursor(aiomysql.DictCursor) as cur:
                 await cur.execute(
                     "SELECT 1 FROM upload_files "
-                    "WHERE session_id = %s AND message_id IS NULL LIMIT 1",
+                    "WHERE session_id = %s " + _OWNER_SCOPE + "AND message_id IS NULL LIMIT 1",
                     (session_id,),
                 )
                 row = await cur.fetchone()
@@ -265,7 +271,7 @@ class UploadFileDAO:
                 await cur.execute(
                     "SELECT filename, media_type, file_size, created_at, "
                     "message_id, message_pair_id FROM upload_files "
-                    "WHERE session_id = %s ORDER BY id ASC",
+                    "WHERE session_id = %s " + _OWNER_SCOPE + "ORDER BY id ASC",
                     (session_id,),
                 )
                 rows = await cur.fetchall()

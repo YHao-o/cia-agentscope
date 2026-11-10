@@ -109,8 +109,8 @@ api:
 
   # ---- JWT 鉴权 ----
   jwt:
-    # .env 原值（ENC(...) 由 CONFIG_DECRYPT_KEY 在运行时解密）；换环境请重新生成
-    secret: "ENC(gEo+dvLc+DAXSvHChv4j6OddX2u/eibhismVMZBhXZgd5Xug92Z++uYY9ZGdWcELorfx5SHZM4QR4SlVzJpJkSPE1n6cDchS0Ls5UfMHmUM=)"
+    # 必填。通过 api.existingSecret 或部署环境提供各副本共用的签名密钥。
+    secret: ""
     # JWT_EXPIRE_HOURS
     expireHours: 1
 

@@ -16,6 +16,7 @@ import inspect
 import json
 import logging
 import os
+import shlex
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -324,7 +325,9 @@ class OpenSandboxWorkspaceManager:
         if pooled is not None:
             self._record_success()
             return pooled
-        # 池空，走原有创建逻辑
+        # 池空：后台回填一个，同时同步新建不阻塞当前请求
+        if self._pool_refill and self._pool_size > 0:
+            asyncio.create_task(self._refill_one())
         return await self._create_sandbox_raw()
 
     async def _create_sandbox_raw(self) -> Sandbox:
@@ -381,7 +384,7 @@ class OpenSandboxWorkspaceManager:
         """
         session_dir = self._session_dir(session_id)
         try:
-            result = await sbx.commands.run(f"mkdir -p {session_dir} && echo 1")
+            result = await sbx.commands.run(f"mkdir -p {shlex.quote(session_dir)} && echo 1")
             return result.exit_code == 0
         except Exception:
             return False
@@ -450,7 +453,9 @@ class OpenSandboxWorkspaceManager:
 
     async def _prepare_shared_session(self, sbx: Sandbox, session_id: str) -> None:
         """保留 SDK 异常类型，区分明确不存在和临时不可达。"""
-        result = await sbx.commands.run(f"mkdir -p {self._session_dir(session_id)} && echo 1")
+        result = await sbx.commands.run(
+            f"mkdir -p {shlex.quote(self._session_dir(session_id))} && echo 1"
+        )
         if result.exit_code != 0:
             raise SessionDirectoryError("已有沙箱会话目录暂不可用，请稍后重试")
 

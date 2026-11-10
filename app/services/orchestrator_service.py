@@ -40,10 +40,7 @@ from app.services.chat_service import (
     FILE_ONLY_DEFAULT_QUESTION,
     create_model_from_config,
 )
-from app.services.agent_state_store import (
-    load_agent_state,
-    persist_agent_state,
-)
+from app.services.agent_state_store import load_agent_state
 from app.services.upload_context_provider import (
     append_upload_context,
     build_recognizer_file_hint,
@@ -551,11 +548,8 @@ class OrchestratorService:
                             text_parts.append(getattr(block, "text", str(block)))
                     final_output_parts.append("\n".join(text_parts).strip())
 
-                # 保存 AgentState（mode="json" 确保枚举等类型序列化为值，避免落库后无法反序列化）
-                final_state = agent.state.model_dump(mode="json")
-                await persist_agent_state(
-                    session_service, session_id, user_id, agent_id, final_state,
-                )
+                # 检测结果出来前仅暂存，落库由 chat_service 统一处理。
+                round_state.final_states[agent_id] = agent.state.model_dump(mode="json")
 
                 # emit 工具执行期间捕获的 citations（从 ToolResultEndEvent.metadata 累积）
                 citations = tracer.consume_citations()
@@ -676,6 +670,7 @@ class OrchestratorService:
         rs.consumed_upload_ids = []
         rs.restored_files.clear()
         rs.completed_files.clear()
+        rs.final_states.clear()
 
         if not user_input:
             if self._has_file_blocks(messages):
@@ -968,7 +963,7 @@ class OrchestratorService:
         ):
             yield event_str
 
-        # ⑦ 汇总本轮编排结果到请求级状态 + 持久化各 agent 状态
+        # ⑦ 汇总编排结果并暂存各 agent 的待检状态
         # agent_id 列表（去重保序）；成功标志从编排结果派生
         # （任一 TaskResult.success=False 则整体 False；空结果时 all([])=True）
         round_state.agent_ids = list(dict.fromkeys(
@@ -979,6 +974,4 @@ class OrchestratorService:
         )
         for r in orchestrator._last_results:
             if r.final_state:
-                await persist_agent_state(
-                    session_service, session_id, user_id, r.agent_id, r.final_state,
-                )
+                round_state.final_states[r.agent_id] = r.final_state

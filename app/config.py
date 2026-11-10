@@ -25,7 +25,9 @@ INTENT_CONFIG_PATH = "./config/intent_config.yml"
 
 JWT_ALGORITHM = "HS256"
 # 支持 ENC(...) 密文（由 CONFIG_DECRYPT_KEY 解密）或明文（向后兼容）
-JWT_SECRET = _resolve_secret(os.getenv("JWT_SECRET", "please-change-this-secret"), _CONFIG_KEY)
+JWT_SECRET = _resolve_secret(os.getenv("JWT_SECRET", ""), _CONFIG_KEY)
+if JWT_SECRET.strip() in ("", "please-change-this-secret"):
+    raise RuntimeError("请配置独立的 JWT_SECRET，不能使用空值或旧的默认密钥")
 JWT_EXPIRE_HOURS = int(os.getenv("JWT_EXPIRE_HOURS", "8"))
 JWT_REFRESH_EXPIRE_DAYS = int(os.getenv("JWT_REFRESH_EXPIRE_DAYS", "7"))
 
@@ -46,6 +48,12 @@ UPLOAD_MAX_SIZE_MB = int(os.getenv("UPLOAD_MAX_SIZE_MB", "20"))
 UPLOAD_AV_MAX_SIZE_MB = int(os.getenv("UPLOAD_AV_MAX_SIZE_MB", "200"))
 # 上传文件解析统一超时（秒）：MinerU 轮询与音频转写共用
 UPLOAD_PARSE_TIMEOUT = int(os.getenv("UPLOAD_PARSE_TIMEOUT", "60"))
+# 后台解析并发上限：超出部分排队等待，避免同时解析大量大文件拖垮服务
+UPLOAD_PARSE_CONCURRENCY = int(os.getenv("UPLOAD_PARSE_CONCURRENCY", "3"))
+# 每进程接纳上限，包括读取正文、排队和解析中的文件。
+UPLOAD_MAX_INFLIGHT = int(os.getenv("UPLOAD_MAX_INFLIGHT", str(UPLOAD_PARSE_CONCURRENCY * 2)))
+if UPLOAD_PARSE_CONCURRENCY < 1 or UPLOAD_MAX_INFLIGHT < UPLOAD_PARSE_CONCURRENCY:
+    raise RuntimeError("UPLOAD_PARSE_CONCURRENCY 必须大于 0，UPLOAD_MAX_INFLIGHT 必须不小于解析并发")
 UPLOAD_ALLOWED_MEDIA_TYPES = [
     "image/jpeg",
     "image/png",

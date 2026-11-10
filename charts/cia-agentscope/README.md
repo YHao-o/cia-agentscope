@@ -124,7 +124,7 @@ helm upgrade --install oia-agentscope ./deploy/helm/oia-agentscope -n oia
 # 生产（敏感项走 Secret）
 kubectl -n oia create secret generic oia-agentscope-secret \
   --from-literal=CONFIG_DECRYPT_KEY='<加密主密钥>' \
-  --from-literal=JWT_SECRET='ENC(...)' \
+  --from-literal=JWT_SECRET='<该环境独立生成的签名密钥或密文>' \
   --from-literal=MYSQL_PASSWORD='ENC(...)' \
   --from-literal=REDIS_URL='redis://:password@host:6379/0' \
   --from-literal=LANGFUSE_PUBLIC_KEY='pk-lf-xxx' \

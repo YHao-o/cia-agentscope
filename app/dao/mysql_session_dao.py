@@ -463,6 +463,61 @@ class SessionDAO:
     # Session 元信息
     # ================================================================
 
+    async def reserve_session(self, session_id: str, user_id: str) -> dict:
+        """通过主键冲突串行化首次使用，不覆盖已登记属主或软删状态。"""
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await conn.begin()
+                try:
+                    now = datetime.now(_BEIJING_TZ)
+                    await cur.execute(
+                        "INSERT INTO sessions (session_id, user_id, name, created_at, updated_at) "
+                        "VALUES (%s, %s, '', %s, %s) "
+                        "ON DUPLICATE KEY UPDATE session_id = sessions.session_id",
+                        (session_id, user_id, now, now),
+                    )
+                    created = cur.rowcount == 1
+                    await cur.execute(
+                        "SELECT user_id, deleted_at FROM sessions WHERE session_id = %s FOR UPDATE",
+                        (session_id,),
+                    )
+                    owner = await cur.fetchone()
+                    if created:
+                        # 兼容部署前仅上传、还未建会话的记录；存在其他属主则拒绝认领。
+                        await cur.execute(
+                            "SELECT id FROM upload_files WHERE session_id = %s "
+                            "AND user_id <> %s LIMIT 1",
+                            (session_id, user_id),
+                        )
+                        if await cur.fetchone():
+                            raise PermissionError("该会话已有其他用户的上传记录")
+                    await conn.commit()
+                    return owner
+                except BaseException:
+                    await conn.rollback()
+                    raise
+
+    async def get_session_owner_status(self, session_id: str) -> Optional[dict]:
+        """查询会话属主与删除状态（不过滤软删）。
+
+        供入口区分『已删除』与『不存在』，并为持久化文件下载做属主校验。
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(
+                    "SELECT user_id, deleted_at FROM sessions "
+                    "WHERE session_id = %s",
+                    (session_id,),
+                )
+                row = await cur.fetchone()
+                await conn.commit()
+                if row is None:
+                    return None
+                return {
+                    "user_id": row["user_id"],
+                    "deleted_at": row["deleted_at"],
+                }
+
     async def get_session_meta(self, session_id: str) -> Optional[dict]:
         """获取会话元信息。"""
         async with self.pool.acquire() as conn:
@@ -520,6 +575,8 @@ class SessionDAO:
                     "agent_ids FROM sessions "
                     "WHERE user_id = %s AND is_pinned = 1 "
                     "AND deleted_at IS NULL "
+                    # 属主登记（reserve_session）会先建行，过滤仅上传未发消息的空会话
+                    "AND message_count > 0 "
                     "ORDER BY pinned_at DESC "
                     "LIMIT %s",
                     (user_id, pinned_limit),
@@ -548,7 +605,8 @@ class SessionDAO:
                 await cur.execute(
                     "SELECT COUNT(*) AS cnt FROM sessions "
                     "WHERE user_id = %s AND is_pinned = 0 "
-                    "AND deleted_at IS NULL",
+                    "AND deleted_at IS NULL "
+                    "AND message_count > 0",
                     (user_id,),
                 )
                 cnt_row = await cur.fetchone()
@@ -562,6 +620,7 @@ class SessionDAO:
                     "agent_ids FROM sessions "
                     "WHERE user_id = %s AND is_pinned = 0 "
                     "AND deleted_at IS NULL "
+                    "AND message_count > 0 "
                     "ORDER BY updated_at DESC "
                     "LIMIT %s OFFSET %s",
                     (user_id, page_size, offset),

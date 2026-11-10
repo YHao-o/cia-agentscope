@@ -17,9 +17,54 @@ from pathlib import Path
 
 import httpx
 
-from app.config import MINERU_API_KEY, MINERU_BASE_URL, UPLOAD_PARSE_TIMEOUT
+from app.config import (
+    MINERU_API_KEY,
+    MINERU_BASE_URL,
+    UPLOAD_PARSE_CONCURRENCY,
+    UPLOAD_MAX_INFLIGHT,
+    UPLOAD_PARSE_TIMEOUT,
+)
 
 logger = logging.getLogger(__name__)
+
+# 后台解析并发信号量：模块级单例，超出上限的任务排队等待
+_PARSE_SEMAPHORE = asyncio.Semaphore(UPLOAD_PARSE_CONCURRENCY)
+
+
+class UploadAdmission:
+    """事件循环内无 await 的接纳计数；读取正文前拒绝超量请求。"""
+
+    def __init__(self, capacity: int):
+        if capacity < 1:
+            raise ValueError("上传接纳容量必须大于 0")
+        self.capacity = capacity
+        self.active = 0
+
+    def acquire(self):
+        from fastapi import HTTPException
+        if self.active >= self.capacity:
+            raise HTTPException(status_code=429, detail="文件解析繁忙，请稍后重试", headers={"Retry-After": "5"})
+        self.active += 1
+        return _UploadLease(self)
+
+
+class _UploadLease:
+    def __init__(self, owner):
+        self.owner = owner
+        self.released = False
+
+    def release(self):
+        if not self.released:
+            self.released = True
+            self.owner.active -= 1
+
+
+_UPLOAD_ADMISSION = UploadAdmission(UPLOAD_MAX_INFLIGHT)
+_PARSE_TASKS: set[asyncio.Task] = set()
+
+
+def acquire_upload_slot():
+    return _UPLOAD_ADMISSION.acquire()
 
 # 音频扩展名（media_type 可能缺失或不规范，扩展名兜底）
 _AUDIO_EXTENSIONS = {".m4a", ".mp3", ".wav", ".webm", ".aac", ".ogg", ".flac", ".wma"}
@@ -283,7 +328,10 @@ async def _parse_and_store(dao, file_id: int, content: bytes, filename: str, par
         elif parse_type == "asr":
             parsed = await transcribe_audio(content, filename, file_id)
         elif parse_type == "plain_text":
-            parsed = content.decode("utf-8", errors="replace")
+            try:
+                parsed = content.decode("utf-8")
+            except UnicodeDecodeError:
+                parsed = content.decode("gbk", errors="replace")
         else:
             parsed = None
 
@@ -326,8 +374,17 @@ async def _parse_and_store(dao, file_id: int, content: bytes, filename: str, par
                 pass
 
 
+async def _parse_and_store_limited(
+    dao, file_id: int, content: bytes, filename: str, parse_type: str
+) -> None:
+    """信号量限流后执行解析：超出并发上限的任务在后台排队，不影响上传响应。"""
+    async with _PARSE_SEMAPHORE:
+        await _parse_and_store(dao, file_id, content, filename, parse_type)
+
+
 async def start_background_parse(
-    request, session_id: str, user_id: str, filename: str, media_type: str, content: bytes
+    request, session_id: str, user_id: str, filename: str, media_type: str, content: bytes,
+    *, admission=None,
 ) -> int:
     """插入 pending 记录并启动后台解析任务，立即返回 file_id。
 
@@ -339,14 +396,25 @@ async def start_background_parse(
     if dao is None:
         raise RuntimeError("upload_file_dao 未初始化（app.state.upload_file_dao 缺失）")
 
-    parse_type = classify_parse_type(media_type, filename)
-    file_id = await dao.insert(
-        session_id, user_id, filename, media_type, parse_type, len(content)
-    )
-
-    # plain_text / none 无需异步网络调用，但仍走统一后台任务保证响应延迟一致
-    asyncio.create_task(
-        _parse_and_store(dao, file_id, content, filename, parse_type),
-        name=f"upload-parse-{file_id}",
-    )
-    return file_id
+    admission = admission or acquire_upload_slot()
+    try:
+        parse_type = classify_parse_type(media_type, filename)
+        file_id = await dao.insert(
+            session_id, user_id, filename, media_type, parse_type, len(content)
+        )
+        task = asyncio.create_task(
+            _parse_and_store_limited(dao, file_id, content, filename, parse_type),
+            name=f"upload-parse-{file_id}",
+        )
+        _PARSE_TASKS.add(task)
+        # done 回调也覆盖任务尚未开始执行就被取消的情况。
+        def finished(completed):
+            _PARSE_TASKS.discard(completed)
+            admission.release()
+            if not completed.cancelled():
+                completed.exception()
+        task.add_done_callback(finished)
+        return file_id
+    except BaseException:
+        admission.release()
+        raise

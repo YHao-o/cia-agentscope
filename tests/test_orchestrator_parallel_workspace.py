@@ -68,6 +68,28 @@ class _FakeRegistry:
         return object()
 
 
+@pytest.mark.asyncio
+async def test_orchestrator_only_stages_child_states():
+    from types import SimpleNamespace
+    from unittest.mock import AsyncMock
+
+    svc = _make_service([], ws_delay=0)
+    orchestrator = _FakeOrchestrator()
+    children = {"a": {"summary": "part A"}, "b": {"summary": "part B"}}
+    orchestrator._last_results = [
+        SimpleNamespace(agent_id=aid, success=True, final_state=state)
+        for aid, state in children.items()
+    ]
+    svc._create_orchestrator = lambda mode, factory: orchestrator
+    service = SimpleNamespace(load_agent_state=AsyncMock(return_value=None), save_agent_state=AsyncMock())
+    round_state = RoundState()
+    async for _ in svc.run(MESSAGES, session_service=service, session_id="s1",
+                           user_id="u1", round_state=round_state):
+        pass
+    assert round_state.final_states == children
+    service.save_agent_state.assert_not_awaited()
+
+
 def _make_service(marks: list, ws_delay: float = 0.3, ws_error: Exception | None = None):
     """构造只保留 run() 编排逻辑的服务实例，三个装配方法全部打桩。"""
     svc = OrchestratorService.__new__(OrchestratorService)

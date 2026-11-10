@@ -30,3 +30,5 @@ class RoundState:
     restored_files: dict[str, tuple[str, str]] = field(default_factory=dict)
     # 成功结束的写操作产生的版本，用于用户停止后的保守归档。
     completed_files: dict[str, tuple[str, str]] = field(default_factory=dict)
+    # 仅保存在本轮内存中的快照，最终输出放行后提交。
+    final_states: dict[str, dict] = field(default_factory=dict)
