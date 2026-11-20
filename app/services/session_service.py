@@ -69,6 +69,17 @@ class SessionService:
         """从 PostgreSQL 加载 AgentState 原始数据。"""
         return await self.dao.load_agent_state(session_id, agent_id)
 
+    async def get_latest_agent_state(self, session_id: str) -> Optional[dict]:
+        """查询某会话下最近更新的 agent 状态（跨智能体上下文共享用）。
+
+        仅 MySQL DAO 支持该方法；Redis DAO 本身按 session 共享状态，
+        无需此查询。方法不存在时返回 None，由调用方退化为新建状态。
+        """
+        method = getattr(self.dao, "get_latest_agent_state", None)
+        if method is None:
+            return None
+        return await method(session_id)
+
     async def save_agent_state(self, session_id: str, user_id: str, agent_id: str, state_dict: dict) -> None:
         """将 AgentState dict 持久化到 PostgreSQL。"""
         await self.dao.save_agent_state(session_id, user_id, agent_id, state_dict)

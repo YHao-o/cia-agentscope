@@ -84,6 +84,31 @@ class SessionDAO:
                     return json.loads(state_val)
                 return state_val
 
+    async def get_latest_agent_state(
+        self, session_id: str
+    ) -> Optional[dict]:
+        """查询某会话下最近更新的 agent 状态（跨智能体上下文共享用）。
+
+        返回最近 updated_at 的那条 state JSON。用于用户在同一会话内
+        切换智能体时，新智能体继承最近轮次的对话上下文。
+        """
+        async with self.pool.acquire() as conn:
+            async with conn.cursor(aiomysql.DictCursor) as cur:
+                await cur.execute(
+                    "SELECT state FROM agent_states "
+                    "WHERE session_id = %s "
+                    "ORDER BY updated_at DESC LIMIT 1",
+                    (session_id,),
+                )
+                row = await cur.fetchone()
+                await conn.commit()
+                if row is None:
+                    return None
+                state_val = row["state"]
+                if isinstance(state_val, str):
+                    return json.loads(state_val)
+                return state_val
+
     async def save_agent_state(
         self,
         session_id: str,
@@ -440,13 +465,14 @@ class SessionDAO:
         session_id: str,
         user_id: str,
         message_pair_id: str,
-        feedback: int,
+        feedback: Optional[int],
         comment: Optional[str] = None,
     ) -> int:
         """点赞点踩落库：按 (session_id, message_pair_id) 定位本轮 assistant
         消息行写入 feedback（1=赞 0=踩）与 feedback_comment（评价内容）。
         行级 user_id 条件防越权。覆盖语义：本次提交的 comment 覆盖旧值
-        （未填则清空）。
+        （未填则清空）。feedback 为 None 表示取消评价：feedback 与
+        feedback_comment 一并置回 NULL。
 
         多智能体一轮产生多条 assistant 行时全部更新（本轮回复整体反馈）。
         返回更新行数；0 表示消息不存在或不属于当前用户。
@@ -458,7 +484,10 @@ class SessionDAO:
                     "WHERE session_id = %s AND user_id = %s "
                     "AND message_pair_id = %s AND role = 'assistant' "
                     "AND deleted_at IS NULL",
-                    (int(feedback), comment, session_id, user_id, message_pair_id),
+                    (
+                        int(feedback) if feedback is not None else None,
+                        comment, session_id, user_id, message_pair_id,
+                    ),
                 )
                 updated = cur.rowcount
                 await conn.commit()

@@ -962,20 +962,25 @@ async def generate_response(
 
     if inferred_agent_id:
         if not agent_id:
+            # 前端未指定 agent_id：从历史推断，保证同一会话内 agent 一致、
+            # 多轮上下文连续（agent_states 按 session_id+agent_id 分库存储）。
             agent_id = inferred_agent_id
             logger.info(
                 "[chat_service] 未指定 agent_id，从历史推断为 %s session=%s",
                 agent_id, session_id,
             )
         elif agent_id != inferred_agent_id:
-            # 前端传来的 agent_id 与历史最后一轮不一致，强制对齐到历史 agent_id
-            # 以保证多轮上下文连续。如需切换 agent，请新建会话。
-            logger.warning(
-                "[chat_service] agent_id 不一致：前端传入=%s 历史最后一轮=%s，"
-                "强制对齐到历史 agent_id 以保持上下文连续 session=%s",
+            # 前端显式传入了与历史不同的 agent_id：尊重用户的显式选择，
+            # 不强制回退到历史智能体。否则用户在同一会话内切换智能体时
+            # 实际执行的仍是旧智能体，导致新智能体绑定的工具（如
+            # regulations_agent 的 policy_qa）不可用。
+            # 代价是新智能体加载不到旧智能体的多轮上下文，但这是用户
+            # 主动切换的预期行为。
+            logger.info(
+                "[chat_service] 用户显式切换智能体：前端传入=%s 历史最后一轮=%s，"
+                "使用前端传入的 agent_id session=%s",
                 agent_id, inferred_agent_id, session_id,
             )
-            agent_id = inferred_agent_id
 
     final_output_parts: List[str] = []
     # 制度问答引用（从编排流 policy_qa_citations 事件累积，随 assistant 消息落库）

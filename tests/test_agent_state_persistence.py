@@ -78,6 +78,7 @@ async def test_load_returns_none_when_dao_returns_none():
 
     session_service = MagicMock()
     session_service.load_agent_state = AsyncMock(return_value=None)
+    session_service.get_latest_agent_state = AsyncMock(return_value=None)
     assert await load_agent_state(session_service, "s1", "a1") is None
 
 
@@ -86,6 +87,7 @@ async def test_load_returns_none_when_dao_returns_empty():
 
     session_service = MagicMock()
     session_service.load_agent_state = AsyncMock(return_value={})
+    session_service.get_latest_agent_state = AsyncMock(return_value=None)
     assert await load_agent_state(session_service, "s1", "a1") is None
 
 
@@ -169,6 +171,47 @@ async def test_load_logs_warning_on_dao_failure(caplog):
 
     assert result is None
     assert any("读取" in r.message and "失败" in r.message for r in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_load_inherits_context_from_latest_agent_when_no_own_state():
+    """目标 agent 无历史状态时，继承同会话最近 agent 的对话上下文。"""
+    latest_state = {
+        "session_id": "s1",
+        "context": [
+            {"role": "user", "content": "你好"},
+            {"role": "assistant", "content": "你好！有什么可以帮你的？"},
+        ],
+        "summary": "用户打招呼",
+        "permission_context": {"mode": "bypass"},
+    }
+
+    session_service = MagicMock()
+    # 目标 agent 无状态
+    session_service.load_agent_state = AsyncMock(return_value=None)
+    # 但同会话下有最近 agent 的状态
+    session_service.get_latest_agent_state = AsyncMock(return_value=latest_state)
+
+    loaded = await load_agent_state(session_service, "s1", "regulations_agent")
+    assert loaded is not None
+    assert isinstance(loaded, AgentState)
+    # 继承了对话上下文
+    assert len(loaded.context) == 2
+    assert loaded.summary == "用户打招呼"
+    # agent 特定字段被重置
+    assert loaded.cur_iter == 0
+
+
+@pytest.mark.asyncio
+async def test_load_returns_none_when_latest_state_not_dict():
+    """最近 agent 状态非 dict（历史数据损坏）时，退化为新建状态，不崩溃。"""
+    session_service = MagicMock()
+    session_service.load_agent_state = AsyncMock(return_value=None)
+    # 模拟损坏数据：返回 list 而非 dict
+    session_service.get_latest_agent_state = AsyncMock(return_value=["not", "a", "dict"])
+
+    result = await load_agent_state(session_service, "s1", "regulations_agent")
+    assert result is None
 
 
 # ================================================================

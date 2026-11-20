@@ -58,6 +58,11 @@ async def load_agent_state(
     """加载单个 agent 的 AgentState：从 session_service 读取 + 历史脏数据迁移
     + trim 截断 + 异常兜底。
 
+    跨智能体上下文共享：当目标 agent 无历史状态时，回退到同会话下最近
+    更新的 agent 状态，继承其对话历史（context + summary），但重置
+    agent 特定字段（cur_iter、reply_id、tool_context 等），保证
+    用户在同一会话内切换智能体时能看到之前的对话内容。
+
     session_service 为空或读取失败均返回 None（调用方创建新状态）。
     反序列化失败时记录 warning（含异常栈），便于定位 schema 不兼容问题。
     """
@@ -71,18 +76,61 @@ async def load_agent_state(
             exc_info=True,
         )
         return None
-    if not state_dict:
-        logger.info(
-            "[agent_state_store] 无历史状态 session=%s agent=%s",
-            session_id, agent_id,
-        )
-        return None
 
-    ctx_len = len(state_dict.get("context") or [])
-    logger.info(
-        "[agent_state_store] 加载状态 session=%s agent=%s context_len=%d",
-        session_id, agent_id, ctx_len,
-    )
+    # 目标 agent 无历史状态：尝试继承同会话最近 agent 的对话上下文
+    if not state_dict:
+        try:
+            latest = await session_service.get_latest_agent_state(session_id)
+        except Exception:
+            logger.warning(
+                "[agent_state_store] 查询最近 agent 状态失败，将新建 "
+                "session=%s agent=%s", session_id, agent_id, exc_info=True,
+            )
+            latest = None
+
+        if not latest:
+            logger.info(
+                "[agent_state_store] 无历史状态 session=%s agent=%s",
+                session_id, agent_id,
+            )
+            return None
+
+        # 防御性校验：latest 应为 dict；若非 dict（历史数据损坏），
+        # 退化为新建状态，避免 .get() 抛 AttributeError。
+        if not isinstance(latest, dict):
+            logger.warning(
+                "[agent_state_store] 最近 agent 状态非 dict，跳过继承 "
+                "session=%s agent=%s type=%s",
+                session_id, agent_id, type(latest).__name__,
+            )
+            return None
+
+        # 继承对话历史（context + summary），重置 agent 特定字段：
+        # - cur_iter 重置为 0（新 agent 从第 0 轮开始）
+        # - reply_id 重新生成
+        # - tool_context 使用默认（不同 agent 工具集不同，避免继承旧激活状态）
+        inherited_ctx = latest.get("context") or []
+        if not isinstance(inherited_ctx, list):
+            inherited_ctx = []
+        inherited_summary = latest.get("summary") or ""
+        state_dict = {
+            "session_id": session_id,
+            "context": inherited_ctx,
+            "summary": inherited_summary,
+            "permission_context": latest.get("permission_context")
+            or {"mode": "bypass"},
+        }
+        logger.info(
+            "[agent_state_store] 目标 agent 无状态，继承最近对话上下文 "
+            "session=%s agent=%s inherited_context_len=%d",
+            session_id, agent_id, len(inherited_ctx),
+        )
+    else:
+        ctx_len = len(state_dict.get("context") or [])
+        logger.info(
+            "[agent_state_store] 加载状态 session=%s agent=%s context_len=%d",
+            session_id, agent_id, ctx_len,
+        )
 
     # 历史脏数据迁移：修正 "PermissionMode.BYPASS" → "bypass" 等
     state_dict = migrate_legacy_enum_values(state_dict)

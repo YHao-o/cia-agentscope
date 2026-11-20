@@ -20,16 +20,20 @@ async def submit_feedback(
 
     落库：messages.feedback（1=赞 0=踩），按 (session_id, message_pair_id)
     定位本轮 assistant 消息行，行级 user_id 条件防越权；刷新会话详情即可回显。
-    Langfuse：评分写入失败不影响接口结果（仅告警），未启用时跳过。
+    liked 为 null 表示取消评价：feedback 与 feedback_comment 一并置回 NULL。
+    Langfuse：评分写入失败不影响接口结果（仅告警），未启用或取消时跳过。
     """
     session_dao = request.app.state.session_dao
 
     # 1) 落库（主路径）
-    feedback_value = 1 if body.liked else 0
-    # 评价内容：去除首尾空白，截断到 VARCHAR(1024) 上限内
+    # liked 为 None 表示取消评价：feedback 与 feedback_comment 一并清空。
+    feedback_value = None if body.liked is None else (1 if body.liked else 0)
+    # 评价内容：去除首尾空白，截断到 VARCHAR(1024) 上限内；取消时一并清空。
     comment = (body.comment or "").strip() or None
     if comment:
         comment = comment[:1024]
+    if feedback_value is None:
+        comment = None
     updated = await session_dao.update_message_feedback(
         session_id=body.session_id,
         user_id=str(user.get("user_id", "")),
@@ -46,9 +50,9 @@ async def submit_feedback(
             ).model_dump(),
         )
 
-    # 2) Langfuse 双写（尽力而为，失败不阻断）
+    # 2) Langfuse 双写（尽力而为，失败不阻断；取消评价时无评分可写，跳过）
     langfuse_service = request.app.state.langfuse_service
-    if langfuse_service and langfuse_service.enabled:
+    if feedback_value is not None and langfuse_service and langfuse_service.enabled:
         try:
             ok = langfuse_service.create_score(
                 trace_id=body.trace_id,
